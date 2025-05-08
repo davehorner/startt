@@ -2,7 +2,7 @@
 release-plz update --allow-dirty
 
 # 2) Grab the 5-char SHA of that new HEAD
-$sha = git rev-parse --short=5 HEAD
+$sha = git rev-parse --short=7 HEAD
 
 # 3) Pull the version out of Cargo.toml
 $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' |
@@ -11,7 +11,7 @@ $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' |
 # 4) Format today’s date as yy/MM/dd
 $date = Get-Date -Format 'yy/MM/dd'
 
-# 5) Build the LAST_RELEASE content
+# 7) Build the LAST_RELEASE content
 $content = "$date|$sha|$version"
 
 # 6) Write LAST_RELEASE (no trailing newline)
