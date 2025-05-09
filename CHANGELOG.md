@@ -12,3 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Other
 
 - `startt` solves a long-standing Windows poor design/quirk: when you do
+## [0.1.1](https://github.com/davehorner/startt/compare/v0.1.0...v0.1.1) - 2025-05-09
+
+### Added
+
+- *(gui-launch)* improve HWND detection, URL handler resolution, and window positioning
