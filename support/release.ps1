@@ -1,6 +1,9 @@
 # 1) Let release-plz bump, commit and tag
 release-plz update --allow-dirty
 
+git add -u
+git commit --amend --no-edit
+
 # 2) Grab the 5-char SHA of that new HEAD
 $sha = git rev-parse --short=7 HEAD
 
@@ -19,4 +22,4 @@ Set-Content -Path LAST_RELEASE -Value $content -Encoding UTF8
 
 # 7) Amend the release-plz commit to include LAST_RELEASE
 git add LAST_RELEASE
-git commit --amend --no-edit
+git commit --amend -F LAST_RELEASE

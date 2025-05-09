@@ -1,6 +1,6 @@
 [package]
 name        = "startt"
-version     = "0.1.0"
+version     = "0.1.1"
 edition     = "2024"
 authors     = ["David Horner"]
 description = "Automate detection of HWND and real PID for apps launched through ShellExecuteEx (cmd start, Explorer, PowerShell)"
@@ -15,5 +15,6 @@ categories  = ["command-line-utilities", "windows"]
 [dependencies]
 clap = { version = "4.5.37", features = ["derive"] }
 widestring = "1.2.0"
-winapi = { version = "0.3.9", features = ["handleapi", "libloaderapi", "psapi", "shellapi", "tlhelp32", "winbase", "winuser"] }
+winapi = { version = "0.3.9", features = ["processenv","handleapi", "libloaderapi", "psapi", "shellapi", "tlhelp32", "winbase", "winuser"] }
 windows = { version = "0.61.1", features = ["Win32_Foundation", "Win32_UI_Shell", "Win32_System_Threading","Win32_UI_WindowsAndMessaging","Win32_System_Registry"] }
+winreg = "0.55.0"

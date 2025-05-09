@@ -36,7 +36,7 @@ See also:
 **startt solves the problem of finding the hwnd and process id of a command or url that is launched by cmd.exe /c start, explorer <url>, start-process, or anything that calls shellexecuteex under the covers.**
 
 its rough around the edges and not intended for any purpose but demonstration.
-it shakes up to 7 found windows in most recent order;  tested with chrome, vscode, mpv.
+it shakes the 1st found window;  tested with chrome, vscode, mpv, msedge, cmd.
 
 --dave horner
 5/25
