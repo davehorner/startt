@@ -25,6 +25,9 @@ use winapi::um::winuser::{EnumWindows, GetWindowThreadProcessId};
 use winapi::um::winuser::{
     GetWindowPlacement, SW_MINIMIZE, SW_RESTORE, ShowWindow, WINDOWPLACEMENT,
 };
+use winapi::um::winuser::{EnumDisplayMonitors, GetMonitorInfoW, MONITORINFO, MonitorFromPoint, MONITOR_DEFAULTTOPRIMARY};
+use winapi::shared::windef::{HMONITOR, POINT, RECT};
+use std::sync::{Arc, Mutex};
 
 unsafe extern "system" {
     fn WaitForInputIdle(hProcess: HANDLE, dwMilliseconds: u32) -> u32;
@@ -583,28 +586,133 @@ fn find_most_recent_gui_apps(
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut args = env::args_os().skip(1);
-    let mut follow_children = false;
-    let mut new_args = Vec::new();
+// Add this struct for grid state:
+struct GridState {
+    rows: u32,
+    cols: u32,
+    monitor: i32,
+    next_cell: usize,
+    monitor_rect: RECT,
+}
 
-    while let Some(arg) = args.next() {
-        if arg == "-f" || arg == "--follow" {
-            follow_children = true;
+impl GridState {
+    fn next_position(&mut self, win_width: i32, win_height: i32) -> (i32, i32) {
+        let total_cells = (self.rows * self.cols) as usize;
+        let cell = self.next_cell % total_cells;
+        self.next_cell += 1;
+        let row = cell / self.cols as usize;
+        let col = cell % self.cols as usize;
+        let cell_w = (self.monitor_rect.right - self.monitor_rect.left) / self.cols as i32;
+        let cell_h = (self.monitor_rect.bottom - self.monitor_rect.top) / self.rows as i32;
+        let x = self.monitor_rect.left + col as i32 * cell_w + (cell_w - win_width) / 2;
+        let y = self.monitor_rect.top + row as i32 * cell_h + (cell_h - win_height) / 2;
+        (x, y)
+    }
+}
+
+// Helper to get monitor RECT by index (0 = primary)
+fn get_monitor_rect(monitor_index: i32) -> RECT {
+    let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+    let found = Arc::new(Mutex::new(false));
+    let rect_arc = Arc::new(Mutex::new(rect));
+    let count = Arc::new(Mutex::new(0));
+    unsafe extern "system" fn enum_monitor_proc(
+        hmonitor: HMONITOR,
+        _hdc: winapi::shared::windef::HDC,
+        _lprc: *mut RECT,
+        lparam: winapi::shared::minwindef::LPARAM,
+    ) -> i32 {
+        let (target, found, rect_arc, count): &mut (i32, Arc<Mutex<bool>>, Arc<Mutex<RECT>>, Arc<Mutex<i32>>) =
+            &mut *(lparam as *mut (i32, Arc<Mutex<bool>>, Arc<Mutex<RECT>>, Arc<Mutex<i32>>));
+        let mut idx = count.lock().unwrap();
+        if *idx == *target {
+            let mut mi: MONITORINFO = std::mem::zeroed();
+            mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+            if GetMonitorInfoW(hmonitor, &mut mi) != 0 {
+                let mut r = rect_arc.lock().unwrap();
+                *r = mi.rcWork;
+                let mut f = found.lock().unwrap();
+                *f = true;
+            }
+            return 0; // stop
+        }
+        *idx += 1;
+        1 // continue
+    }
+    let mut tuple = (monitor_index, found.clone(), rect_arc.clone(), count.clone());
+    unsafe {
+        EnumDisplayMonitors(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            Some(enum_monitor_proc),
+            &mut tuple as *mut _ as isize,
+        );
+    }
+    if *found.lock().unwrap() {
+        *rect_arc.lock().unwrap()
+    } else {
+        // fallback to primary monitor
+        let pt = POINT { x: 0, y: 0 };
+        let hmon = unsafe { MonitorFromPoint(pt, MONITOR_DEFAULTTOPRIMARY) };
+        let mut mi: MONITORINFO = unsafe { std::mem::zeroed() };
+        mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if unsafe { GetMonitorInfoW(hmon, &mut mi) } != 0 {
+            mi.rcWork
         } else {
-            new_args.push(arg);
-            break;
+            RECT { left: 0, top: 0, right: 1920, bottom: 1080 }
         }
     }
+}
+// Helper function for parsing grid argument
+fn parse_grid_arg(grid_str: &str) -> (u32, u32, i32) {
+    let (rc, m) = if let Some(idx) = grid_str.find('m') {
+        (&grid_str[..idx], Some(&grid_str[idx+1..]))
+    } else {
+        (grid_str, None)
+    };
+    let parts: Vec<&str> = rc.split('x').collect();
+    if parts.len() != 2 {
+        panic!("Grid argument must be in the form ROWSxCOLS or ROWSxCOLSmDISPLAY, got '{}'", grid_str);
+    }
+    let rows = parts[0].parse::<u32>().expect("Invalid ROWS in grid argument");
+    let cols = parts[1].parse::<u32>().expect("Invalid COLS in grid argument");
+    let monitor = m.and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
+    (rows, cols, monitor)
+}
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+         let mut grid: Option<(u32, u32, i32)> = None;
+let mut follow_children = false;
+let mut positional_args = Vec::new();
 
-    // Push the rest of the arguments
-    new_args.extend(args);
-
-    let mut args = new_args.into_iter();
+let mut args = env::args_os().skip(1).peekable();
+while let Some(arg) = args.next() {
+    let arg_str = arg.to_string_lossy();
+    if arg_str == "-f" || arg_str == "--follow" {
+        follow_children = true;
+    } else if arg_str == "-g" || arg_str == "--grid" {
+        let grid_arg = args.next().expect("Expected ROWSxCOLS or ROWSxCOLSmDISPLAY after -g/--grid");
+        let grid_str = grid_arg.to_string_lossy();
+        let (rows, cols, monitor) = parse_grid_arg(&grid_str);
+        grid = Some((rows, cols, monitor));
+        println!("Grid set to {}x{} on monitor {}", rows, cols, monitor);
+    } else if arg_str.starts_with("-g") && arg_str.len() > 2 {
+        // Support -g2x2 or -g2x2m1
+        let grid_str = &arg_str[2..];
+        let (rows, cols, monitor) = parse_grid_arg(grid_str);
+        grid = Some((rows, cols, monitor));
+        println!("Grid set to {}x{} on monitor {}", rows, cols, monitor);
+    } else {
+        positional_args.push(arg);
+        // Push the rest as positional args
+        positional_args.extend(args);
+        break;
+    }
+}
+println!("Arguments: {:?}", positional_args);
+    let mut args = positional_args.into_iter();
     let mut file = args
         .next()
-        .expect("Usage: startt [-f] <executable|document|URL> [args...]");
-
+        .expect("Usage: startt [-f] [-g ROWSxCOLSmDISPLAY#] <executable|document|URL> [args...]");
 
     // Reconstruct the parameter string (everything after the first token)
     let mut params = args
@@ -655,7 +763,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let params_w = if params.is_empty() {
         None
     } else {
-        Some(U16CString::from_str(params)?)
+        Some(U16CString::from_str(&params)?)
     };
 
     // Launch the process
@@ -686,10 +794,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Launched PID = {}", parent_pid);
         println!("Launched HWND = {:?}", sei.hwnd);
         println!("Launched file = {:?}", file);
+        println!("Launching: file={:?} params={:?}", file, params);
         WaitForInputIdle(sei.hProcess, winapi::um::winbase::INFINITE);
         sleep(Duration::from_millis(1000));
         let gui = find_most_recent_gui_apps(&file.to_string_lossy(), 1);
 
+        // Create grid state if needed
+        let mut grid_state: Option<GridState> = grid.map(|(rows, cols, monitor)| {
+            let monitor_rect = get_monitor_rect(monitor);
+            GridState { rows, cols, monitor, next_cell: 0, monitor_rect }
+        });
+if let Some(ref grid_state) = grid_state {
+    println!(
+        "Grid enabled: {}x{} on monitor {} (rect: left={}, top={}, right={}, bottom={})",
+        grid_state.rows,
+        grid_state.cols,
+        grid_state.monitor,
+        grid_state.monitor_rect.left,
+        grid_state.monitor_rect.top,
+        grid_state.monitor_rect.right,
+        grid_state.monitor_rect.bottom
+    );
+}
+        // --- Parent window(s) ---
         for (i, (hwnd, pid, class_name, bounds)) in gui.clone().into_iter().enumerate() {
             println!(
                 "{}. HWND = {:?}, PID = {}, Class = {}, Bounds = {:?}",
@@ -700,7 +827,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 bounds
             );
 
-            // Check if the window is minimized
             let mut placement: WINDOWPLACEMENT = std::mem::zeroed();
             placement.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
 
@@ -709,72 +835,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     placement.showCmd == winapi::um::winuser::SW_SHOWMINIMIZED.try_into().unwrap();
                 if was_minimized {
                     println!("Window {:?} is minimized. Restoring...", hwnd);
-                    // Restore the window
                     ShowWindow(hwnd, SW_RESTORE);
-                    // Wait briefly to ensure the window is restored
                     sleep(Duration::from_millis(500));
                 }
 
-                // Get screen dimensions
-                let screen_width =
-                    winapi::um::winuser::GetSystemMetrics(winapi::um::winuser::SM_CXSCREEN);
-                let screen_height =
-                    winapi::um::winuser::GetSystemMetrics(winapi::um::winuser::SM_CYSCREEN);
-
-                // Save the original position of the window
-                let original_position = (bounds.0, bounds.1);
-
-                // Calculate new position to center the window with a 10% border around
-                let border_x = (screen_width as f32 * 0.1) as i32;
-                let border_y = (screen_height as f32 * 0.1) as i32;
-                let new_x = border_x + (screen_width - 2 * border_x - bounds.2) / 2;
-                let new_y = border_y + (screen_height - 2 * border_y - bounds.3) / 2;
-
-                // Move the window to the calculated position
-                SetWindowPos(
-                    hwnd,
-                    std::ptr::null_mut(),
-                    new_x,
-                    new_y,
-                    0,
-                    0,
-                    SWP_NOSIZE | SWP_NOZORDER,
-                );
-
-                // Verify if the window actually moved
-                let mut rect = std::mem::zeroed();
-                if winapi::um::winuser::GetWindowRect(hwnd, &mut rect) == 0 {
-                    eprintln!("Failed to get window rect for HWND {:?}", hwnd);
-                    continue; // Skip this window if we can't get its rect
-                }
-
-                if rect.left != new_x || rect.top != new_y {
+                // Move to grid cell if grid is enabled
+                if let Some(ref mut grid_state) = grid_state {
+                    let (win_width, win_height) = (bounds.2, bounds.3);
+                    let (new_x, new_y) = grid_state.next_position(win_width, win_height);
                     println!(
-                        "Window {:?} did not move to the expected position. Skipping.",
-                        hwnd
+                        "Moving HWND {:?} to grid cell: ({}, {}) size=({}, {})",
+                        hwnd, new_x, new_y, win_width, win_height
                     );
-                    continue; // Skip this window if it didn't move
+                    SetWindowPos(
+                        hwnd,
+                        std::ptr::null_mut(),
+                        new_x,
+                        new_y,
+                        0,
+                        0,
+                        SWP_NOSIZE | SWP_NOZORDER,
+                    );
                 }
 
-                println!("Moved window to center with border: {:?}", hwnd);
-
-                // Shake the window
                 println!("Shaking window: {:?}", hwnd);
                 shake_window(hwnd, 10, 2000);
 
-                // Restore the original position
-                println!("Restoring window to original position: {:?}", hwnd);
-                SetWindowPos(
-                    hwnd,
-                    std::ptr::null_mut(),
-                    original_position.0,
-                    original_position.1,
-                    0,
-                    0,
-                    SWP_NOSIZE | SWP_NOZORDER,
-                );
-
-                // If the window was minimized, minimize it again
+                // Optionally, re-minimize if it was minimized
                 if was_minimized {
                     println!("Re-minimizing window: {:?}", hwnd);
                     ShowWindow(hwnd, SW_MINIMIZE);
@@ -783,6 +870,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("Failed to get window placement for HWND {:?}", hwnd);
             }
         }
+
         if gui.is_empty() {
             // Find the HWND using the real PID
             let hwnd = find_hwnd_by_pid(parent_pid).ok_or_else(|| {
@@ -798,6 +886,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut failed_hwnds = HashSet::new();
         let mut failed_pids: HashSet<u32> = HashSet::new();
 
+        // --- Child windows in follow_children loop ---
         while follow_children {
             // Check if the parent process is still running by opening with minimal rights and waiting for its exit
             let process_handle = unsafe { OpenProcess(winapi::um::winnt::SYNCHRONIZE, 0, parent_pid) };
@@ -845,7 +934,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 {
                     continue;
                 }
-                println!("Shaking HWND for child: {:?} (PID: {})", hwnd, pid);
                 let mut rect = std::mem::zeroed();
                 if unsafe { winapi::um::winuser::GetWindowRect(hwnd, &mut rect) } == 0 {
                     eprintln!("Failed to get window rect for HWND {:?} (PID: {})", hwnd, pid);
@@ -853,7 +941,74 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     failed_pids.insert(pid); // Mark this PID as failed
                     continue;
                 }
-                shake_window(hwnd, 10, 2000);
+                // Print HWND info: class name and window type (top-level/child)
+                let mut class_name = [0u16; 256];
+                let class_name_len = unsafe {
+                    winapi::um::winuser::GetClassNameW(
+                        hwnd,
+                        class_name.as_mut_ptr(),
+                        class_name.len() as i32,
+                    )
+                };
+                let class_name_str = if class_name_len > 0 {
+                    OsString::from_wide(&class_name[..class_name_len as usize])
+                        .to_string_lossy()
+                        .to_string()
+                } else {
+                    String::from("<unknown>")
+                };
+                // Skip windows with class name "NVOpenGLPbuffer" or starting with "wgpu Device Class"
+                if class_name_str == "NVOpenGLPbuffer" || class_name_str.starts_with("wgpu Device Class") {
+                    println!(
+                        "Skipping HWND {:?} (PID: {}) due to class name: {}",
+                        hwnd, pid, class_name_str
+                    );
+                    continue;
+                }
+
+                let parent_hwnd = unsafe { winapi::um::winuser::GetParent(hwnd) };
+                let window_type = if parent_hwnd.is_null() {
+                    "Top-level"
+                } else {
+                    println!(
+                        "Skipping child HWND {:?} (PID: {}) with parent HWND {:?}",
+                        hwnd, pid, parent_hwnd
+                    );
+                    continue;
+                };
+                println!(
+                    "Shaking child HWND {:?} (PID: {}) at rect: left={}, top={}, right={}, bottom={} | Class: {} | Type: {}",
+                    hwnd, pid, rect.left, rect.top, rect.right, rect.bottom, class_name_str, window_type
+                );
+
+
+
+                // Only now do we move to a grid cell and shake
+                if let Some(ref mut grid_state) = grid_state {
+                    let win_width = rect.right - rect.left;
+                    let win_height = rect.bottom - rect.top;
+                    let (new_x, new_y) = grid_state.next_position(win_width, win_height);
+                    println![
+                        "Moving child HWND {:?} to grid cell: ({}, {}) size=({}, {})",
+                        hwnd, new_x, new_y, win_width, win_height
+                    ];
+                    SetWindowPos(
+                        hwnd,
+                        std::ptr::null_mut(),
+                        new_x,
+                        new_y,
+                        0,
+                        0,
+                        SWP_NOSIZE | SWP_NOZORDER,
+                    );
+                }
+
+                // Shake the window in a non-blocking way (spawn a thread)
+                let hwnd_copy = hwnd as isize;
+                std::thread::spawn(move || {
+                    let hwnd = hwnd_copy as HWND;
+                    shake_window(hwnd, 10, 2000);
+                });
                 shaken_hwnds.insert(hwnd);
             }
 
@@ -865,3 +1020,4 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+

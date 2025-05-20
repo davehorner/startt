@@ -30,9 +30,18 @@ Because it uses only Win32 APIs (`OpenProcess`, `GetProcessImageFileNameW`, `Get
 
 **Usage:**
 ```
-startt [-f|--follow] <executable|document|URL> [args...]
+startt [-f|--follow] [-g ROWSxCOLS|--grid ROWSxCOLS] <executable|document|URL> [args...]
 ```
 - Use `-f` or `--follow` to keep watching for and shaking new child windows.
+- Use `-g ROWSxCOLS` or `--grid ROWSxCOLS` to tile each window into a grid on the primary monitor (e.g., `-g 2x2` for a 2x2 grid).
+- You can also specify a monitor with `-g ROWSxCOLSmN` (e.g., `-g 2x2m1` for monitor 1, zero-based).
+
+**Examples:**
+```
+startt -f -g2x2 cargo e --run-all 10
+```
+
+When grid mode is enabled, each window (parent or child) is moved to the next cell in the grid, wrapping around as needed. This works for both the initial window and any new windows found in follow mode.
 
 See also:  
 - A protocol‐handler for launching & controlling Chrome via CDP  
