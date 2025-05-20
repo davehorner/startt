@@ -41,6 +41,16 @@ startt [-f|--follow] [-g ROWSxCOLS|--grid ROWSxCOLS] <executable|document|URL> [
 startt -f -g2x2 cargo e --run-all 10
 ```
 
+```
+REM cmd.exe
+REM I hope you have a wide monitor.
+startt -f -g1x5 cmd /k "for %i in (0 1 2 3 4) do start powershell -NoProfile -Command \"$host.ui.RawUI.WindowTitle = 'Prompt %i PID=' + $PID; echo Prompt %i PID=$PID; Start-Sleep -Seconds 99999\""
+```
+```
+# powershell
+startt -f -g1x5 powershell -NoProfile -WindowStyle Normal -Command "1..5 | ForEach-Object { Start-Process powershell -ArgumentList '-NoProfile','-Command','$host.ui.RawUI.WindowTitle = \"Prompt $_ PID=\" + $PID; Write-Host Prompt $_ PID=$PID; Start-Sleep -Seconds 99999' }; Start-Sleep -Seconds 99999"
+```
+
 When grid mode is enabled, each window (parent or child) is moved to the next cell in the grid, wrapping around as needed. This works for both the initial window and any new windows found in follow mode.
 
 See also:  

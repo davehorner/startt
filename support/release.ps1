@@ -22,4 +22,8 @@ Set-Content -Path LAST_RELEASE -Value $content -Encoding UTF8
 
 # 7) Amend the release-plz commit to include LAST_RELEASE
 git add LAST_RELEASE
-git commit --amend -F LAST_RELEASE
+# 7) Append LAST_RELEASE contents to the end of the existing commit message
+$existing = git log -1 --pretty=%B
+$last = Get-Content LAST_RELEASE -Raw
+$combined = "$existing`n`n$last"
+git commit --amend -m "$combined"
