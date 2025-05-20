@@ -1,33 +1,44 @@
 // src/main.rs
+#[cfg(not(feature = "uses_etw"))]
+#[allow(unused_imports)]
+#[cfg(feature = "uses_etw")]
+use ferrisetw::parser::Parser;
+#[cfg(feature = "uses_etw")]
+use ferrisetw::trace::UserTrace;
+#[cfg(feature = "uses_etw")]
+use ferrisetw::{EventRecord, SchemaLocator};
 use std::collections::HashSet;
 use std::env;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::sleep;
 use std::time::Duration;
 use widestring::U16CString;
-use winapi::shared::minwindef::{FALSE, FILETIME};
+use winapi::shared::minwindef::FALSE;
 use winapi::shared::windef::HWND;
+use winapi::shared::windef::{HMONITOR, POINT, RECT};
 use winapi::um::handleapi::CloseHandle;
 use winapi::um::processthreadsapi::GetProcessId;
-use winapi::um::processthreadsapi::{GetProcessTimes, OpenProcess};
-use winapi::um::psapi::GetProcessImageFileNameW;
+use winapi::um::processthreadsapi::OpenProcess;
+// use winapi::um::psapi::GetProcessImageFileNameW;
 use winapi::um::tlhelp32::{
     CreateToolhelp32Snapshot, PROCESSENTRY32, Process32First, Process32Next, TH32CS_SNAPPROCESS,
 };
 use winapi::um::winnt::HANDLE;
-use winapi::um::winnt::{PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
+// use winapi::um::winnt::{PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
 use winapi::um::winuser::SWP_NOSIZE;
 use winapi::um::winuser::SWP_NOZORDER;
 use winapi::um::winuser::SetWindowPos;
+use winapi::um::winuser::{
+    EnumDisplayMonitors, GetMonitorInfoW, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint,
+};
 use winapi::um::winuser::{EnumWindows, GetWindowThreadProcessId};
 use winapi::um::winuser::{
     GetWindowPlacement, SW_MINIMIZE, SW_RESTORE, ShowWindow, WINDOWPLACEMENT,
 };
-use winapi::um::winuser::{EnumDisplayMonitors, GetMonitorInfoW, MONITORINFO, MonitorFromPoint, MONITOR_DEFAULTTOPRIMARY};
-use winapi::shared::windef::{HMONITOR, POINT, RECT};
-use std::sync::{Arc, Mutex};
 
 unsafe extern "system" {
     fn WaitForInputIdle(hProcess: HANDLE, dwMilliseconds: u32) -> u32;
@@ -36,7 +47,7 @@ unsafe extern "system" {
 fn get_parent_pid(pid: u32) -> Option<u32> {
     unsafe {
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if snapshot == ptr::null_mut() {
+        if snapshot.is_null() {
             eprintln!("Failed to create process snapshot");
             return None;
         }
@@ -121,7 +132,7 @@ fn get_child_pids(parent_pid: u32) -> Vec<u32> {
     unsafe {
         // Take a snapshot of all processes
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if snapshot == ptr::null_mut() {
+        if snapshot.is_null() {
             eprintln!("Failed to create process snapshot");
             return child_pids;
         }
@@ -161,7 +172,7 @@ fn shake_window(hwnd: HWND, intensity: i32, duration_ms: u64) {
         winapi::um::winuser::SetForegroundWindow(hwnd);
 
         // Get the current position of the window
-        let mut rect = std::mem::zeroed();
+        let mut rect: RECT = std::mem::zeroed();
         if winapi::um::winuser::GetWindowRect(hwnd, &mut rect) == 0 {
             eprintln!("Failed to get window rect");
             return;
@@ -240,349 +251,61 @@ fn shake_window(hwnd: HWND, intensity: i32, duration_ms: u64) {
     }
 }
 
-fn filetime_to_unix_time(ft: FILETIME) -> u64 {
-    let high = (ft.dwHighDateTime as u64) << 32;
-    let low = ft.dwLowDateTime as u64;
-    // FILETIME is in 100-nanosecond intervals since January 1, 1601 (UTC)
-    // Convert to seconds since UNIX epoch (January 1, 1970)
-    (high | low) / 10_000_000 - 11_644_473_600
-}
+#[cfg(feature = "uses_etw")]
+fn start_etw_process_tracker_with_schema(root_pid: u32, tracked_pids: Arc<Mutex<HashSet<u32>>>) {
+    #[cfg(feature = "uses_etw")]
+    {
+        use ferrisetw::parser::Parser;
+        let process_callback =
+            move |record: &EventRecord, schema_locator: &SchemaLocator| match schema_locator
+                .event_schema(record)
+            {
+                Ok(schema) => {
+                    let event_id = record.event_id();
+                    let parser = Parser::create(record, &schema);
+                    let process_id: u32 = parser.try_parse("ProcessID").unwrap_or(0);
+                    let parent_id: u32 = parser.try_parse("ParentID").unwrap_or(0);
+                    let image_name: String = parser
+                        .try_parse("ImageName")
+                        .unwrap_or_else(|_| "N/A".to_string());
 
-fn find_most_recent_gui_apps(
-    program_name: &str,
-    num_recent: usize,
-) -> Vec<(HWND, u32, String, (i32, i32, i32, i32))> {
-    unsafe {
-        struct EnumData {
-            windows: Vec<(HWND, u32, u64, String, (i32, i32, i32, i32))>,
-            target_program_name: String,
-        }
-
-        extern "system" fn enum_windows_proc(hwnd: HWND, lparam: isize) -> i32 {
-            let data = unsafe { &mut *(lparam as *mut EnumData) };
-
-            // println!("Enumerating HWND: {:?}", hwnd);
-
-            // // Check if the window is visible
-            // if unsafe { IsWindowVisible(hwnd) } == 0 {
-            //     println!("HWND {:?} is not visible. Skipping.", hwnd);
-            //     return 1; // Continue enumeration
-            // }
-
-            // Check if the window has the WS_VISIBLE style
-            let style = unsafe {
-                winapi::um::winuser::GetWindowLongW(hwnd, winapi::um::winuser::GWL_STYLE)
-            };
-            if (style & winapi::um::winuser::WS_VISIBLE as i32) == 0 {
-                // println!("HWND {:?} does not have WS_VISIBLE style. Skipping.", hwnd);
-                return 1; // Continue enumeration
-            }
-
-            // Check if the window is a top-level window
-            let parent_hwnd = unsafe { winapi::um::winuser::GetParent(hwnd) };
-            if !parent_hwnd.is_null() {
-                println!("HWND {:?} is not a top-level window. Skipping.", hwnd);
-                // return 1; // Skip non-top-level windows
-            }
-
-            // Get the process ID for the window
-            let mut process_id = 0;
-            unsafe {
-                GetWindowThreadProcessId(hwnd, &mut process_id);
-            }
-            // println!("HWND {:?} belongs to process ID: {}", hwnd, process_id);
-
-            // Open the process to get its creation time and executable name
-            let process_handle =
-                unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, process_id) };
-            let _cleanup = CleanupHandle {
-                handle: process_handle,
-            };
-
-            struct CleanupHandle {
-                handle: HANDLE,
-            }
-
-            //oh rust, how I love thee...
-            impl Drop for CleanupHandle {
-                fn drop(&mut self) {
-                    // println!("Cleaning up handle: {:?}", self.handle);
-                    if !self.handle.is_null() {
-                        unsafe { CloseHandle(self.handle) };
-                    }
-                }
-            }
-            if process_handle.is_null() {
-                // println!("Failed to open process for PID {}. Skipping HWND {:?}.", process_id, hwnd);
-                return 1; // Continue enumeration
-            }
-
-            // Get the executable name
-            let mut exe_path = [0u16; 260];
-            let exe_len = unsafe {
-                GetProcessImageFileNameW(
-                    process_handle,
-                    exe_path.as_mut_ptr(),
-                    exe_path.len() as u32,
-                )
-            };
-
-            if exe_len == 0 {
-                // println!("Failed to get executable name for PID {}. Skipping HWND {:?}.", process_id, hwnd);
-                return 1; // Continue enumeration
-            }
-
-            let exe_name = OsString::from_wide(&exe_path[..exe_len as usize])
-                .to_string_lossy()
-                .to_string();
-            // println!("Executable name for PID {}: {}", process_id, exe_name);
-
-            // Get the class name of the window
-            let mut class_name = [0u16; 256];
-            let class_name_len = unsafe {
-                winapi::um::winuser::GetClassNameW(
-                    hwnd,
-                    class_name.as_mut_ptr(),
-                    class_name.len() as i32,
-                )
-            };
-
-            let class_name_str = if class_name_len > 0 {
-                OsString::from_wide(&class_name[..class_name_len as usize])
-                    .to_string_lossy()
-                    .to_string()
-            } else {
-                // eprintln!("Failed to get class name for HWND {:?}", hwnd);
-                String::new()
-            };
-            // println!("Class name for HWND {:?}: {}", hwnd, class_name_str);
-
-            // If the executable name is "cmd.exe", check the command-line arguments
-            if exe_name.to_ascii_lowercase().ends_with("cmd.exe") {
-                println!("Executable name is cmd.exe. Checking command-line arguments...");
-                let mut cmdline = [0u16; 32768];
-                let cmdline_len = unsafe {
-                    {
-                        let cmdline_ptr = winapi::um::processenv::GetCommandLineW();
-                        if cmdline_ptr.is_null() {
-                            0
-                        } else {
-                            let mut len = 0;
-                            while *cmdline_ptr.add(len) != 0 {
-                                cmdline[len] = *cmdline_ptr.add(len);
-                                len += 1;
-                            }
-                            len as u32
+                    // Only print events for the root process or its children
+                    if parent_id == root_pid {
+                        if event_id == 1 {
+                            println!(
+                                "Process START: PID={}, PPID={}, ImageName={}",
+                                process_id, parent_id, image_name
+                            );
+                            tracked_pids.lock().unwrap().insert(process_id);
+                        } else if event_id == 2 {
+                            let exit_code: u32 = parser.try_parse("ExitCode").unwrap_or(0);
+                            println!(
+                                "Process EXIT: PID={}, ExitCode={}, ImageName={}",
+                                process_id, exit_code, image_name
+                            );
                         }
                     }
-                };
-
-                if cmdline_len > 0 {
-                    let cmdline_str = OsString::from_wide(&cmdline[..cmdline_len as usize])
-                        .to_string_lossy()
-                        .to_string();
-
-                    // Check if the command-line arguments contain the target program name
-                    if !cmdline_str
-                        .to_ascii_lowercase()
-                        .contains(&data.target_program_name.to_ascii_lowercase())
-                    {
-                        return 1; // Continue enumeration
-                    }
-
-                    println!("Command-line arguments for cmd.exe: {}", cmdline_str);
-                } else {
-                    // If we can't retrieve the command-line arguments, skip this window
-                    return 1; // Continue enumeration
                 }
-            }
-
-            // Check if the executable name contains the target program name
-            if !exe_name
-                .to_ascii_lowercase()
-                .contains(&data.target_program_name.to_ascii_lowercase())
-            {
-                // If the target program name has no extension, try adding .exe or .com
-                if !data.target_program_name.contains('.') {
-                    let exe_name_with_ext = format!("{}.exe", data.target_program_name);
-                    let com_name_with_ext = format!("{}.com", data.target_program_name);
-
-                    if exe_name
-                        .to_ascii_lowercase()
-                        .contains(&exe_name_with_ext.to_ascii_lowercase())
-                        || exe_name
-                            .to_ascii_lowercase()
-                            .contains(&com_name_with_ext.to_ascii_lowercase())
-                    {
-                        println!(
-                            "Executable name '{}' matches target with extension '{}'.",
-                            exe_name, data.target_program_name
-                        );
-                    } else {
-                        return 1; // Continue enumeration
-                    }
-                } else {
-                    return 1; // Continue enumeration
-                }
-                return 1; // Continue enumeration
-            } else {
-                println!(
-                    "Executable name '{}' matches target '{}'.",
-                    exe_name, data.target_program_name
-                );
-            }
-
-            // Get the process creation time
-            let mut creation_time = FILETIME {
-                dwLowDateTime: 0,
-                dwHighDateTime: 0,
-            };
-            let mut exit_time = FILETIME {
-                dwLowDateTime: 0,
-                dwHighDateTime: 0,
-            };
-            let mut kernel_time = FILETIME {
-                dwLowDateTime: 0,
-                dwHighDateTime: 0,
-            };
-            let mut user_time = FILETIME {
-                dwLowDateTime: 0,
-                dwHighDateTime: 0,
+                Err(err) => println!("Error {:?}", err),
             };
 
-            let success = unsafe {
-                GetProcessTimes(
-                    process_handle,
-                    &mut creation_time,
-                    &mut exit_time,
-                    &mut kernel_time,
-                    &mut user_time,
-                )
-            };
+        let process_provider =
+            ferrisetw::provider::Provider::by_guid("22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716") // Microsoft-Windows-Kernel-Process
+                .add_callback(process_callback)
+                .build();
 
-            if success == 0 {
-                println!(
-                    "Failed to get process times for PID {}. Skipping HWND {:?}.",
-                    process_id, hwnd
-                );
-                return 1; // Continue enumeration
-            }
+        // Generate a random trace name to avoid "AlreadyExist" error
+        let random_trace_name = format!("MyTrace_{}", rand::random::<u32>());
+        let (_user_trace, handle) = UserTrace::new()
+            .named(random_trace_name)
+            .enable(process_provider)
+            .start()
+            .unwrap();
 
-            // Convert creation time to UNIX timestamp
-            let creation_time_unix = filetime_to_unix_time(creation_time);
-            println!(
-                "Creation time for PID {}: {}",
-                process_id, creation_time_unix
-            );
-
-            // Get the window bounds
-            let mut rect = unsafe { std::mem::zeroed() };
-            if unsafe { winapi::um::winuser::GetWindowRect(hwnd, &mut rect) } == 0 {
-                eprintln!("Failed to get window rect for HWND {:?}", hwnd);
-                return 1; // Continue enumeration
-            }
-
-            let bounds = (
-                rect.left,
-                rect.top,
-                rect.right - rect.left,
-                rect.bottom - rect.top,
-            );
-            println!("Bounds for HWND {:?}: {:?}", hwnd, bounds);
-            // If the bounds are zero, try to get the parent window
-            if bounds.2 == 0 || bounds.3 == 0 {
-                let parent_hwnd = unsafe { winapi::um::winuser::GetParent(hwnd) };
-                if !parent_hwnd.is_null() {
-                    println!(
-                        "Bounds are zero for HWND {:?}. Using parent HWND {:?} instead.",
-                        hwnd, parent_hwnd
-                    );
-
-                    // Get the bounds of the parent window
-                    let mut parent_rect = unsafe { std::mem::zeroed() };
-                    if unsafe { winapi::um::winuser::GetWindowRect(parent_hwnd, &mut parent_rect) }
-                        != 0
-                    {
-                        let parent_bounds = (
-                            parent_rect.left,
-                            parent_rect.top,
-                            parent_rect.right - parent_rect.left,
-                            parent_rect.bottom - parent_rect.top,
-                        );
-                        println!(
-                            "Bounds for parent HWND {:?}: {:?}",
-                            parent_hwnd, parent_bounds
-                        );
-
-                        // Add the parent window to the list instead
-                        data.windows.push((
-                            parent_hwnd,
-                            process_id,
-                            creation_time_unix,
-                            class_name_str,
-                            parent_bounds,
-                        ));
-                    } else {
-                        eprintln!(
-                            "Failed to get bounds for parent HWND {:?}. Skipping.",
-                            parent_hwnd
-                        );
-                    }
-                } else {
-                    eprintln!("No parent HWND found for HWND {:?}. Skipping.", hwnd);
-                }
-                return 1; // Continue enumeration
-            }
-            // Add the window to the list
-            data.windows
-                .push((hwnd, process_id, creation_time_unix, class_name_str, bounds));
-
-            1 // Continue enumeration
-        }
-
-        let program_name = if program_name.starts_with('"') && program_name.ends_with('"') {
-            program_name
-                .trim_matches('"')
-                .rsplit('\\')
-                .next()
-                .unwrap_or(&program_name)
-                .to_string()
-        } else {
-            program_name
-                .rsplit('\\')
-                .next()
-                .unwrap_or(&program_name)
-                .to_string()
-        };
-
-        let mut data = EnumData {
-            windows: Vec::new(),
-            target_program_name: program_name.to_string(),
-        };
-
-        println!("Starting enumeration for program name: {}", program_name);
-        EnumWindows(Some(enum_windows_proc), &mut data as *mut _ as isize);
-
-        // Sort windows by creation time (most recent first)
-        println!("Sorting windows by creation time...");
-        data.windows
-            .sort_by_key(|&(_, _, creation_time, _, _)| std::cmp::Reverse(creation_time));
-
-        // Return the top `num_recent` windows
-        let result = data
-            .windows
-            .into_iter()
-            .take(num_recent)
-            .map(|(hwnd, pid, _, class_name, bounds)| (hwnd, pid, class_name, bounds))
-            .collect::<Vec<_>>();
-
-        println!(
-            "Found {} recent GUI apps matching '{}': {:?}",
-            result.len(),
-            program_name,
-            result
-        );
-        result
+        std::thread::spawn(move || {
+            let status = <UserTrace as ferrisetw::trace::TraceTrait>::process_from_handle(handle);
+            println!("Trace ended with status {:?}", status);
+        });
     }
 }
 
@@ -612,7 +335,12 @@ impl GridState {
 
 // Helper to get monitor RECT by index (0 = primary)
 fn get_monitor_rect(monitor_index: i32) -> RECT {
-    let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+    let rect = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
     let found = Arc::new(Mutex::new(false));
     let rect_arc = Arc::new(Mutex::new(rect));
     let count = Arc::new(Mutex::new(0));
@@ -622,24 +350,35 @@ fn get_monitor_rect(monitor_index: i32) -> RECT {
         _lprc: *mut RECT,
         lparam: winapi::shared::minwindef::LPARAM,
     ) -> i32 {
-        let (target, found, rect_arc, count): &mut (i32, Arc<Mutex<bool>>, Arc<Mutex<RECT>>, Arc<Mutex<i32>>) =
-            &mut *(lparam as *mut (i32, Arc<Mutex<bool>>, Arc<Mutex<RECT>>, Arc<Mutex<i32>>));
-        let mut idx = count.lock().unwrap();
-        if *idx == *target {
-            let mut mi: MONITORINFO = std::mem::zeroed();
-            mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
-            if GetMonitorInfoW(hmonitor, &mut mi) != 0 {
-                let mut r = rect_arc.lock().unwrap();
-                *r = mi.rcWork;
-                let mut f = found.lock().unwrap();
-                *f = true;
+        unsafe {
+            let (target, found, rect_arc, count): &mut (
+                i32,
+                Arc<Mutex<bool>>,
+                Arc<Mutex<RECT>>,
+                Arc<Mutex<i32>>,
+            ) = &mut *(lparam as *mut (i32, Arc<Mutex<bool>>, Arc<Mutex<RECT>>, Arc<Mutex<i32>>));
+            let mut idx = count.lock().unwrap();
+            if *idx == *target {
+                let mut mi: MONITORINFO = std::mem::zeroed();
+                mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+                if GetMonitorInfoW(hmonitor, &mut mi) != 0 {
+                    let mut r = rect_arc.lock().unwrap();
+                    *r = mi.rcWork;
+                    let mut f = found.lock().unwrap();
+                    *f = true;
+                }
+                return 0; // stop
             }
-            return 0; // stop
+            *idx += 1;
+            1 // continue
         }
-        *idx += 1;
-        1 // continue
     }
-    let mut tuple = (monitor_index, found.clone(), rect_arc.clone(), count.clone());
+    let mut tuple = (
+        monitor_index,
+        found.clone(),
+        rect_arc.clone(),
+        count.clone(),
+    );
     unsafe {
         EnumDisplayMonitors(
             std::ptr::null_mut(),
@@ -659,56 +398,73 @@ fn get_monitor_rect(monitor_index: i32) -> RECT {
         if unsafe { GetMonitorInfoW(hmon, &mut mi) } != 0 {
             mi.rcWork
         } else {
-            RECT { left: 0, top: 0, right: 1920, bottom: 1080 }
+            RECT {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1080,
+            }
         }
     }
 }
 // Helper function for parsing grid argument
 fn parse_grid_arg(grid_str: &str) -> (u32, u32, i32) {
     let (rc, m) = if let Some(idx) = grid_str.find('m') {
-        (&grid_str[..idx], Some(&grid_str[idx+1..]))
+        (&grid_str[..idx], Some(&grid_str[idx + 1..]))
     } else {
         (grid_str, None)
     };
     let parts: Vec<&str> = rc.split('x').collect();
     if parts.len() != 2 {
-        panic!("Grid argument must be in the form ROWSxCOLS or ROWSxCOLSmDISPLAY, got '{}'", grid_str);
+        panic!(
+            "Grid argument must be in the form ROWSxCOLS or ROWSxCOLSmDISPLAY, got '{}'",
+            grid_str
+        );
     }
-    let rows = parts[0].parse::<u32>().expect("Invalid ROWS in grid argument");
-    let cols = parts[1].parse::<u32>().expect("Invalid COLS in grid argument");
+    let rows = parts[0]
+        .parse::<u32>()
+        .expect("Invalid ROWS in grid argument");
+    let cols = parts[1]
+        .parse::<u32>()
+        .expect("Invalid COLS in grid argument");
     let monitor = m.and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
     (rows, cols, monitor)
 }
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-         let mut grid: Option<(u32, u32, i32)> = None;
-let mut follow_children = false;
-let mut positional_args = Vec::new();
+    // Shared set for all tracked PIDs (parent + children)
+    let running = Arc::new(AtomicBool::new(true));
 
-let mut args = env::args_os().skip(1).peekable();
-while let Some(arg) = args.next() {
-    let arg_str = arg.to_string_lossy();
-    if arg_str == "-f" || arg_str == "--follow" {
-        follow_children = true;
-    } else if arg_str == "-g" || arg_str == "--grid" {
-        let grid_arg = args.next().expect("Expected ROWSxCOLS or ROWSxCOLSmDISPLAY after -g/--grid");
-        let grid_str = grid_arg.to_string_lossy();
-        let (rows, cols, monitor) = parse_grid_arg(&grid_str);
-        grid = Some((rows, cols, monitor));
-        println!("Grid set to {}x{} on monitor {}", rows, cols, monitor);
-    } else if arg_str.starts_with("-g") && arg_str.len() > 2 {
-        // Support -g2x2 or -g2x2m1
-        let grid_str = &arg_str[2..];
-        let (rows, cols, monitor) = parse_grid_arg(grid_str);
-        grid = Some((rows, cols, monitor));
-        println!("Grid set to {}x{} on monitor {}", rows, cols, monitor);
-    } else {
-        positional_args.push(arg);
-        // Push the rest as positional args
-        positional_args.extend(args);
-        break;
+    let mut grid: Option<(u32, u32, i32)> = None;
+    let mut follow_children = false;
+    let mut positional_args = Vec::new();
+
+    let mut args = env::args_os().skip(1).peekable();
+    while let Some(arg) = args.next() {
+        let arg_str = arg.to_string_lossy();
+        if arg_str == "-f" || arg_str == "--follow" {
+            follow_children = true;
+        } else if arg_str == "-g" || arg_str == "--grid" {
+            let grid_arg = args
+                .next()
+                .expect("Expected ROWSxCOLS or ROWSxCOLSmDISPLAY# after -g/--grid");
+            let grid_str = grid_arg.to_string_lossy();
+            let (rows, cols, monitor) = parse_grid_arg(&grid_str);
+            grid = Some((rows, cols, monitor));
+            println!("Grid set to {}x{} on monitor {}", rows, cols, monitor);
+        } else if arg_str.starts_with("-g") && arg_str.len() > 2 {
+            // Support -g2x2 or -g2x2m1
+            let grid_str = &arg_str[2..];
+            let (rows, cols, monitor) = parse_grid_arg(grid_str);
+            grid = Some((rows, cols, monitor));
+            println!("Grid set to {}x{} on monitor {}", rows, cols, monitor);
+        } else {
+            positional_args.push(arg);
+            // Push the rest as positional args
+            positional_args.extend(args);
+            break;
+        }
     }
-}
-println!("Arguments: {:?}", positional_args);
+    println!("Arguments: {:?}", positional_args);
     let mut args = positional_args.into_iter();
     let mut file = args
         .next()
@@ -784,38 +540,131 @@ println!("Arguments: {:?}", positional_args);
         hProcess: ptr::null_mut(),
         hMonitor: ptr::null_mut(),
     };
-
     unsafe {
         if winapi::um::shellapi::ShellExecuteExW(&mut sei) == 0 {
             return Err(Box::new(std::io::Error::last_os_error()));
         }
-
+        // Get the PID of the process that launched us
+        let launching_pid = get_parent_pid(std::process::id()).unwrap_or(0);
+        println!("Launching PID (parent of this process): {}", launching_pid);
         let parent_pid = GetProcessId(sei.hProcess);
+        let mut parent_hwnd = None;
+        // After launching the process and getting parent_pid:
+        let tracked_pids = Arc::new(Mutex::new(HashSet::new()));
+
+        // Check for admin rights before starting ETW
+        #[cfg(feature = "uses_etw")]
+        if !is_admin::is_admin() {
+            println!("Not running as administrator. ETW process tracking will be disabled.");
+        } else {
+            #[cfg(feature = "uses_etw")]
+            start_etw_process_tracker_with_schema(parent_pid, tracked_pids.clone());
+        }
+        // Ctrl+C handler
+        {
+            let running = running.clone();
+            let tracked_pids_for_ctrlc = tracked_pids.clone();
+            ctrlc::set_handler(move || {
+                println!("\nCtrl+C pressed! Killing all child processes...");
+                running.store(false, Ordering::SeqCst);
+                let mut child_pids = get_child_pids(parent_pid);
+                let etw_pids: Vec<u32> = tracked_pids_for_ctrlc
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .copied()
+                    .collect();
+                for pid in etw_pids {
+                    if !child_pids.contains(&pid) {
+                        child_pids.push(pid);
+                    }
+                }
+                println!("Child PIDs (snapshot + ETW): {:?}", child_pids);
+                for pid in child_pids {
+                    // Try to kill the process
+                    let handle = OpenProcess(winapi::um::winnt::PROCESS_TERMINATE, 0, pid);
+                    if !handle.is_null() {
+                        winapi::um::processthreadsapi::TerminateProcess(handle, 1);
+                        CloseHandle(handle);
+                        println!("Terminated PID {}", pid);
+                    }
+                }
+            })?;
+        }
+
         println!("Launched PID = {}", parent_pid);
         println!("Launched HWND = {:?}", sei.hwnd);
         println!("Launched file = {:?}", file);
         println!("Launching: file={:?} params={:?}", file, params);
         WaitForInputIdle(sei.hProcess, winapi::um::winbase::INFINITE);
         sleep(Duration::from_millis(1000));
-        let gui = find_most_recent_gui_apps(&file.to_string_lossy(), 1);
-
+        let mut gui = startt::find_oldest_recent_apps(
+            &file.to_string_lossy(),
+            1,
+            Some(parent_pid),
+            Some(launching_pid),
+        );
+        // If parent_hwnd is not in gui, check if parent is alive and use that hwnd
+        if parent_hwnd.is_none() {
+            let handle = OpenProcess(winapi::um::winnt::SYNCHRONIZE, 0, parent_pid);
+            if !handle.is_null() {
+                let wait_result = winapi::um::synchapi::WaitForSingleObject(handle, 0);
+                if wait_result != winapi::um::winbase::WAIT_OBJECT_0 {
+                    // Parent is still alive, try to find its HWND
+                    println!(
+                        "Parent process {} is still alive. Searching for HWND...",
+                        parent_pid
+                    );
+                    if let Some(hwnd) = find_hwnd_by_pid(parent_pid) {
+                        println!("Using parent HWND found by PID: {:?}", hwnd);
+                        parent_hwnd = Some(hwnd);
+                        // Set gui to contain the found parent_hwnd so later logic works as expected
+                        // Get the real bounds for the found parent_hwnd
+                        let mut rect = std::mem::zeroed();
+                        if winapi::um::winuser::GetWindowRect(hwnd, &mut rect) != 0 {
+                            let bounds = (
+                                rect.left,
+                                rect.top,
+                                rect.right - rect.left,
+                                rect.bottom - rect.top,
+                            );
+                            gui = vec![(hwnd, parent_pid, String::from("parent"), bounds)];
+                        } else {
+                            // Fallback: use zero bounds if GetWindowRect fails
+                            gui = vec![(hwnd, parent_pid, String::from("parent"), (0, 0, 0, 0))];
+                        }
+                    }
+                } else {
+                    println!("Parent process {} has terminated. Exiting.", parent_pid);
+                }
+                CloseHandle(handle);
+            } else {
+                println!("Parent process {} has terminated. Exiting.", parent_pid);
+            }
+        }
         // Create grid state if needed
         let mut grid_state: Option<GridState> = grid.map(|(rows, cols, monitor)| {
             let monitor_rect = get_monitor_rect(monitor);
-            GridState { rows, cols, monitor, next_cell: 0, monitor_rect }
+            GridState {
+                rows,
+                cols,
+                monitor,
+                next_cell: 0,
+                monitor_rect,
+            }
         });
-if let Some(ref grid_state) = grid_state {
-    println!(
-        "Grid enabled: {}x{} on monitor {} (rect: left={}, top={}, right={}, bottom={})",
-        grid_state.rows,
-        grid_state.cols,
-        grid_state.monitor,
-        grid_state.monitor_rect.left,
-        grid_state.monitor_rect.top,
-        grid_state.monitor_rect.right,
-        grid_state.monitor_rect.bottom
-    );
-}
+        if let Some(ref grid_state) = grid_state {
+            println!(
+                "Grid enabled: {}x{} on monitor {} (rect: left={}, top={}, right={}, bottom={})",
+                grid_state.rows,
+                grid_state.cols,
+                grid_state.monitor,
+                grid_state.monitor_rect.left,
+                grid_state.monitor_rect.top,
+                grid_state.monitor_rect.right,
+                grid_state.monitor_rect.bottom
+            );
+        }
         // --- Parent window(s) ---
         for (i, (hwnd, pid, class_name, bounds)) in gui.clone().into_iter().enumerate() {
             println!(
@@ -858,10 +707,15 @@ if let Some(ref grid_state) = grid_state {
                     );
                 }
 
+                parent_hwnd = Some(hwnd);
                 println!("Shaking window: {:?}", hwnd);
-                shake_window(hwnd, 10, 2000);
+                // Shake the window in a non-blocking way (spawn a thread)
+                let hwnd_copy = hwnd as isize;
+                std::thread::spawn(move || {
+                    let hwnd = hwnd_copy as HWND;
+                    shake_window(hwnd, 10, 2000);
+                });
 
-                // Optionally, re-minimize if it was minimized
                 if was_minimized {
                     println!("Re-minimizing window: {:?}", hwnd);
                     ShowWindow(hwnd, SW_MINIMIZE);
@@ -878,8 +732,15 @@ if let Some(ref grid_state) = grid_state {
                 std::io::Error::new(std::io::ErrorKind::NotFound, "HWND not found")
             })?;
             println!("Found HWND = {:?}", hwnd);
-            shake_window(hwnd, 10, 2000);
+            // Shake the window in a non-blocking way (spawn a thread)
+            let hwnd_copy = hwnd as isize;
+            std::thread::spawn(move || {
+                let hwnd = hwnd_copy as HWND;
+                shake_window(hwnd, 10, 2000);
+            });
+            parent_hwnd = Some(hwnd);
         }
+
         // Track which child HWNDs we've already shaken to avoid repeats
         let mut shaken_hwnds = HashSet::new();
         // Track HWNDs that failed to shake (e.g., GetWindowRect failed)
@@ -887,45 +748,75 @@ if let Some(ref grid_state) = grid_state {
         let mut failed_pids: HashSet<u32> = HashSet::new();
 
         // --- Child windows in follow_children loop ---
-        while follow_children {
-            // Check if the parent process is still running by opening with minimal rights and waiting for its exit
-            let process_handle = unsafe { OpenProcess(winapi::um::winnt::SYNCHRONIZE, 0, parent_pid) };
-            if process_handle.is_null() {
-                println!("Parent process {} has terminated. Exiting.", parent_pid);
-                break;
-            }
-            // WaitForSingleObject returns WAIT_OBJECT_0 if the process has exited
-            let wait_result = unsafe { winapi::um::synchapi::WaitForSingleObject(process_handle, 0) };
-            if wait_result == winapi::um::winbase::WAIT_OBJECT_0 {
-                println!("Parent process {} has terminated. Exiting.", parent_pid);
-                unsafe { CloseHandle(process_handle); }
-                break;
-            }
-            unsafe { CloseHandle(process_handle); }
-            let child_pids = get_child_pids(parent_pid);
-            println!("Child PIDs: {:?}", child_pids);
+        while follow_children && running.load(Ordering::SeqCst) {
+            // // Check if the parent process is still running by opening with minimal rights and waiting for its exit
+            // let process_handle = unsafe { OpenProcess(winapi::um::winnt::SYNCHRONIZE, 0, parent_pid) };
+            // if process_handle.is_null() {
+            //     println!("Parent process {} has terminated. Exiting.", parent_pid);
+            //     break;
+            // }
+            // // WaitForSingleObject returns WAIT_OBJECT_0 if the process has exited
+            // let wait_result = unsafe { winapi::um::synchapi::WaitForSingleObject(process_handle, 0) };
+            // if wait_result == winapi::um::winbase::WAIT_OBJECT_0 {
+            //     println!("Parent process {} has terminated. Exiting.", parent_pid);
+            //     unsafe { CloseHandle(process_handle); }
+            //     break;
+            // }
+            // unsafe { CloseHandle(process_handle); }
 
-            let mut new_hwnds: Vec<HWND> = Vec::new();
-            let mut hwnd_pid_map = Vec::new(); // Track (HWND, PID) pairs
-            unsafe {
-                extern "system" fn enum_windows_proc(hwnd: HWND, lparam: isize) -> i32 {
-                    let (child_pids, hwnds, hwnd_pid_map): &mut (&Vec<u32>, Vec<HWND>, Vec<(HWND, u32)>) =
-                        unsafe { &mut *(lparam as *mut (&Vec<u32>, Vec<HWND>, Vec<(HWND, u32)>)) };
-                    let mut process_id = 0;
-                    unsafe { GetWindowThreadProcessId(hwnd, &mut process_id) };
-                    if child_pids.contains(&process_id) {
-                        hwnds.push(hwnd);
-                        hwnd_pid_map.push((hwnd, process_id));
-                    }
-                    1
+            // let child_pids = get_child_pids(parent_pid);
+            // println!("Child PIDs: {:?}", child_pids);
+            let mut child_pids = get_child_pids(parent_pid);
+            let etw_pids: Vec<u32> = tracked_pids.lock().unwrap().iter().copied().collect();
+            for pid in etw_pids {
+                if !child_pids.contains(&pid) {
+                    child_pids.push(pid);
                 }
-                let mut hwnds = Vec::new();
-                let mut hwnd_pid_map_inner = Vec::new();
-                let mut data = (&child_pids, hwnds, hwnd_pid_map_inner);
-                EnumWindows(Some(enum_windows_proc), &mut data as *mut _ as isize);
-                new_hwnds = data.1;
-                hwnd_pid_map = data.2;
             }
+            println!("Child PIDs (snapshot + ETW): {:?}", child_pids);
+            // Check if any tracked process is still running
+            let mut any_alive = false;
+            let mut all_pids = vec![parent_pid];
+            all_pids.extend(child_pids.iter().copied());
+            for pid in all_pids {
+                let handle = OpenProcess(winapi::um::winnt::SYNCHRONIZE, 0, pid);
+                if !handle.is_null() {
+                    let wait_result = winapi::um::synchapi::WaitForSingleObject(handle, 0);
+                    CloseHandle(handle);
+                    if wait_result != winapi::um::winbase::WAIT_OBJECT_0 {
+                        any_alive = true;
+                        break;
+                    }
+                }
+            }
+            if !any_alive {
+                println!("All tracked processes have terminated. Exiting.");
+                break;
+            }
+
+            let mut _new_hwnds: Vec<HWND> = Vec::new();
+            #[allow(unused_assignments)]
+            let mut hwnd_pid_map = Vec::new(); // Track (HWND, PID) pairs
+            extern "system" fn enum_windows_proc(hwnd: HWND, lparam: isize) -> i32 {
+                let (child_pids, hwnds, hwnd_pid_map): &mut (
+                    &Vec<u32>,
+                    Vec<HWND>,
+                    Vec<(HWND, u32)>,
+                ) = unsafe { &mut *(lparam as *mut (&Vec<u32>, Vec<HWND>, Vec<(HWND, u32)>)) };
+                let mut process_id = 0;
+                unsafe { GetWindowThreadProcessId(hwnd, &mut process_id) };
+                if child_pids.contains(&process_id) {
+                    hwnds.push(hwnd);
+                    hwnd_pid_map.push((hwnd, process_id));
+                }
+                1
+            }
+            let hwnds = Vec::new();
+            let hwnd_pid_map_inner = Vec::new();
+            let mut data = (&child_pids, hwnds, hwnd_pid_map_inner);
+            EnumWindows(Some(enum_windows_proc), &mut data as *mut _ as isize);
+            _new_hwnds = data.1;
+            hwnd_pid_map = data.2;
 
             for (hwnd, pid) in hwnd_pid_map {
                 if shaken_hwnds.contains(&hwnd)
@@ -935,21 +826,22 @@ if let Some(ref grid_state) = grid_state {
                     continue;
                 }
                 let mut rect = std::mem::zeroed();
-                if unsafe { winapi::um::winuser::GetWindowRect(hwnd, &mut rect) } == 0 {
-                    eprintln!("Failed to get window rect for HWND {:?} (PID: {})", hwnd, pid);
+                if winapi::um::winuser::GetWindowRect(hwnd, &mut rect) == 0 {
+                    eprintln!(
+                        "Failed to get window rect for HWND {:?} (PID: {})",
+                        hwnd, pid
+                    );
                     failed_hwnds.insert(hwnd);
                     failed_pids.insert(pid); // Mark this PID as failed
                     continue;
                 }
                 // Print HWND info: class name and window type (top-level/child)
                 let mut class_name = [0u16; 256];
-                let class_name_len = unsafe {
-                    winapi::um::winuser::GetClassNameW(
-                        hwnd,
-                        class_name.as_mut_ptr(),
-                        class_name.len() as i32,
-                    )
-                };
+                let class_name_len = winapi::um::winuser::GetClassNameW(
+                    hwnd,
+                    class_name.as_mut_ptr(),
+                    class_name.len() as i32,
+                );
                 let class_name_str = if class_name_len > 0 {
                     OsString::from_wide(&class_name[..class_name_len as usize])
                         .to_string_lossy()
@@ -958,31 +850,41 @@ if let Some(ref grid_state) = grid_state {
                     String::from("<unknown>")
                 };
                 // Skip windows with class name "NVOpenGLPbuffer" or starting with "wgpu Device Class"
-                if class_name_str == "NVOpenGLPbuffer" || class_name_str.starts_with("wgpu Device Class") {
+                if class_name_str == "NVOpenGLPbuffer"
+                    || class_name_str.starts_with("wgpu Device Class")
+                {
                     println!(
                         "Skipping HWND {:?} (PID: {}) due to class name: {}",
                         hwnd, pid, class_name_str
                     );
                     continue;
                 }
-
-                let parent_hwnd = unsafe { winapi::um::winuser::GetParent(hwnd) };
-                let window_type = if parent_hwnd.is_null() {
+                let this_parent_hwnd = winapi::um::winuser::GetParent(hwnd);
+                if Some(hwnd) == parent_hwnd {
+                    println!("skipping parent");
+                    // Skip the parent window so it is not moved again
+                    continue;
+                }
+                let window_type = if this_parent_hwnd.is_null() {
                     "Top-level"
                 } else {
                     println!(
                         "Skipping child HWND {:?} (PID: {}) with parent HWND {:?}",
-                        hwnd, pid, parent_hwnd
+                        hwnd, pid, this_parent_hwnd
                     );
                     continue;
                 };
                 println!(
                     "Shaking child HWND {:?} (PID: {}) at rect: left={}, top={}, right={}, bottom={} | Class: {} | Type: {}",
-                    hwnd, pid, rect.left, rect.top, rect.right, rect.bottom, class_name_str, window_type
+                    hwnd,
+                    pid,
+                    rect.left,
+                    rect.top,
+                    rect.right,
+                    rect.bottom,
+                    class_name_str,
+                    window_type
                 );
-
-
-
                 // Only now do we move to a grid cell and shake
                 if let Some(ref mut grid_state) = grid_state {
                     let win_width = rect.right - rect.left;
@@ -1015,9 +917,18 @@ if let Some(ref grid_state) = grid_state {
             sleep(Duration::from_millis(2000));
         }
 
+        // After the follow_children loop, restore/show the parent window
+        if let Some(parent_hwnd) = gui.first().map(|(hwnd, _, _, _)| *hwnd) {
+            println!(
+                "Restoring and bringing parent HWND {:?} to front",
+                parent_hwnd
+            );
+            ShowWindow(parent_hwnd, winapi::um::winuser::SW_SHOWNORMAL);
+            winapi::um::winuser::SetForegroundWindow(parent_hwnd);
+        }
+
         winapi::um::handleapi::CloseHandle(sei.hProcess);
     }
 
     Ok(())
 }
-
