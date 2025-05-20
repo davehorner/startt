@@ -1,4 +1,5 @@
 // src/main.rs
+use std::collections::HashSet;
 use std::env;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
@@ -112,6 +113,7 @@ fn find_hwnd_by_pid(pid: u32) -> Option<HWND> {
 #[allow(dead_code)]
 fn get_child_pids(parent_pid: u32) -> Vec<u32> {
     let mut child_pids = Vec::new();
+    let mut stack = vec![parent_pid];
 
     unsafe {
         // Take a snapshot of all processes
@@ -124,20 +126,27 @@ fn get_child_pids(parent_pid: u32) -> Vec<u32> {
         let mut entry: PROCESSENTRY32 = std::mem::zeroed();
         entry.dwSize = std::mem::size_of::<PROCESSENTRY32>() as u32;
 
-        // Iterate through all processes
+        // Collect all process entries into a Vec for easier traversal
+        let mut all_entries = Vec::new();
         if Process32First(snapshot, &mut entry) != FALSE {
             loop {
-                if entry.th32ParentProcessID == parent_pid {
-                    child_pids.push(entry.th32ProcessID);
-                }
-
+                all_entries.push(entry);
                 if Process32Next(snapshot, &mut entry) == FALSE {
                     break;
                 }
             }
         }
-
         CloseHandle(snapshot);
+
+        // Use a stack for DFS to collect all descendants
+        while let Some(pid) = stack.pop() {
+            for e in all_entries.iter() {
+                if e.th32ParentProcessID == pid && !child_pids.contains(&e.th32ProcessID) {
+                    child_pids.push(e.th32ProcessID);
+                    stack.push(e.th32ProcessID);
+                }
+            }
+        }
     }
 
     child_pids
@@ -576,9 +585,26 @@ fn find_most_recent_gui_apps(
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args_os().skip(1);
+    let mut follow_children = false;
+    let mut new_args = Vec::new();
+
+    while let Some(arg) = args.next() {
+        if arg == "-f" || arg == "--follow" {
+            follow_children = true;
+        } else {
+            new_args.push(arg);
+            break;
+        }
+    }
+
+    // Push the rest of the arguments
+    new_args.extend(args);
+
+    let mut args = new_args.into_iter();
     let mut file = args
         .next()
-        .expect("Usage: startt <executable|document|URL> [args...]");
+        .expect("Usage: startt [-f] <executable|document|URL> [args...]");
+
 
     // Reconstruct the parameter string (everything after the first token)
     let mut params = args
@@ -658,9 +684,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let parent_pid = GetProcessId(sei.hProcess);
         println!("Launched PID = {}", parent_pid);
-
+        println!("Launched HWND = {:?}", sei.hwnd);
+        println!("Launched file = {:?}", file);
         WaitForInputIdle(sei.hProcess, winapi::um::winbase::INFINITE);
-        sleep(Duration::from_millis(2000));
+        sleep(Duration::from_millis(1000));
         let gui = find_most_recent_gui_apps(&file.to_string_lossy(), 1);
 
         for (i, (hwnd, pid, class_name, bounds)) in gui.clone().into_iter().enumerate() {
@@ -752,17 +779,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("Re-minimizing window: {:?}", hwnd);
                     ShowWindow(hwnd, SW_MINIMIZE);
                 }
+            } else {
+                eprintln!("Failed to get window placement for HWND {:?}", hwnd);
             }
-            // // Get child PIDs
-            // let child_pids = get_child_pids(parent_pid);
-            // println!("Child PIDs: {:?}", child_pids);
-
-            // // Optionally, find HWNDs for child processes
-            // for child_pid in child_pids {
-            //     if let Some(hwnd) = find_hwnd_by_pid(child_pid) {
-            //         println!("Found HWND for child PID {}: {:?}", child_pid, hwnd);
-            //     }
-            // }
         }
         if gui.is_empty() {
             // Find the HWND using the real PID
@@ -773,6 +792,74 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Found HWND = {:?}", hwnd);
             shake_window(hwnd, 10, 2000);
         }
+        // Track which child HWNDs we've already shaken to avoid repeats
+        let mut shaken_hwnds = HashSet::new();
+        // Track HWNDs that failed to shake (e.g., GetWindowRect failed)
+        let mut failed_hwnds = HashSet::new();
+        let mut failed_pids: HashSet<u32> = HashSet::new();
+
+        while follow_children {
+            // Check if the parent process is still running by opening with minimal rights and waiting for its exit
+            let process_handle = unsafe { OpenProcess(winapi::um::winnt::SYNCHRONIZE, 0, parent_pid) };
+            if process_handle.is_null() {
+                println!("Parent process {} has terminated. Exiting.", parent_pid);
+                break;
+            }
+            // WaitForSingleObject returns WAIT_OBJECT_0 if the process has exited
+            let wait_result = unsafe { winapi::um::synchapi::WaitForSingleObject(process_handle, 0) };
+            if wait_result == winapi::um::winbase::WAIT_OBJECT_0 {
+                println!("Parent process {} has terminated. Exiting.", parent_pid);
+                unsafe { CloseHandle(process_handle); }
+                break;
+            }
+            unsafe { CloseHandle(process_handle); }
+            let child_pids = get_child_pids(parent_pid);
+            println!("Child PIDs: {:?}", child_pids);
+
+            let mut new_hwnds: Vec<HWND> = Vec::new();
+            let mut hwnd_pid_map = Vec::new(); // Track (HWND, PID) pairs
+            unsafe {
+                extern "system" fn enum_windows_proc(hwnd: HWND, lparam: isize) -> i32 {
+                    let (child_pids, hwnds, hwnd_pid_map): &mut (&Vec<u32>, Vec<HWND>, Vec<(HWND, u32)>) =
+                        unsafe { &mut *(lparam as *mut (&Vec<u32>, Vec<HWND>, Vec<(HWND, u32)>)) };
+                    let mut process_id = 0;
+                    unsafe { GetWindowThreadProcessId(hwnd, &mut process_id) };
+                    if child_pids.contains(&process_id) {
+                        hwnds.push(hwnd);
+                        hwnd_pid_map.push((hwnd, process_id));
+                    }
+                    1
+                }
+                let mut hwnds = Vec::new();
+                let mut hwnd_pid_map_inner = Vec::new();
+                let mut data = (&child_pids, hwnds, hwnd_pid_map_inner);
+                EnumWindows(Some(enum_windows_proc), &mut data as *mut _ as isize);
+                new_hwnds = data.1;
+                hwnd_pid_map = data.2;
+            }
+
+            for (hwnd, pid) in hwnd_pid_map {
+                if shaken_hwnds.contains(&hwnd)
+                    || failed_hwnds.contains(&hwnd)
+                    || failed_pids.contains(&pid)
+                {
+                    continue;
+                }
+                println!("Shaking HWND for child: {:?} (PID: {})", hwnd, pid);
+                let mut rect = std::mem::zeroed();
+                if unsafe { winapi::um::winuser::GetWindowRect(hwnd, &mut rect) } == 0 {
+                    eprintln!("Failed to get window rect for HWND {:?} (PID: {})", hwnd, pid);
+                    failed_hwnds.insert(hwnd);
+                    failed_pids.insert(pid); // Mark this PID as failed
+                    continue;
+                }
+                shake_window(hwnd, 10, 2000);
+                shaken_hwnds.insert(hwnd);
+            }
+
+            sleep(Duration::from_millis(2000));
+        }
+
         winapi::um::handleapi::CloseHandle(sei.hProcess);
     }
 
