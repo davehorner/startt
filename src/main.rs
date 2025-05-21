@@ -432,10 +432,13 @@ fn parse_grid_arg(grid_str: &str) -> (u32, u32, i32) {
 }
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Shared set for all tracked PIDs (parent + children)
+    const SHAKE_DURATION: u64 = 2000;
+
     let running = Arc::new(AtomicBool::new(true));
 
     let mut grid: Option<(u32, u32, i32)> = None;
     let mut follow_children = false;
+    let mut follow_forver = false;
     let mut positional_args = Vec::new();
 
     let mut args = env::args_os().skip(1).peekable();
@@ -443,6 +446,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let arg_str = arg.to_string_lossy();
         if arg_str == "-f" || arg_str == "--follow" {
             follow_children = true;
+        } else if arg_str == "-F" || arg_str == "--follow-forver" {
+            follow_children = true;
+            follow_forver = true;
         } else if arg_str == "-g" || arg_str == "--grid" {
             let grid_arg = args
                 .next()
@@ -522,6 +528,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(U16CString::from_str(&params)?)
     };
 
+    // Prepare to collect shake thread handles
+    let mut shake_handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
+
     // Launch the process
     let mut sei = winapi::um::shellapi::SHELLEXECUTEINFOW {
         cbSize: std::mem::size_of::<winapi::um::shellapi::SHELLEXECUTEINFOW>() as u32,
@@ -598,14 +607,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Launching: file={:?} params={:?}", file, params);
         WaitForInputIdle(sei.hProcess, winapi::um::winbase::INFINITE);
         sleep(Duration::from_millis(1000));
-        let mut gui = startt::find_oldest_recent_apps(
-            &file.to_string_lossy(),
-            1,
-            Some(parent_pid),
-            Some(launching_pid),
-        );
-        // If parent_hwnd is not in gui, check if parent is alive and use that hwnd
-        if parent_hwnd.is_none() {
+        let mut gui = if follow_children {
+            startt::find_oldest_recent_apps(
+                &file.to_string_lossy(),
+                1,
+                Some(parent_pid),
+                Some(launching_pid),
+            )
+        } else {
+            startt::find_most_recent_gui_apps(
+                &file.to_string_lossy(),
+                1,
+                Some(parent_pid),
+                Some(launching_pid),
+            )
+        };
+
+        if follow_children {
             let handle = OpenProcess(winapi::um::winnt::SYNCHRONIZE, 0, parent_pid);
             if !handle.is_null() {
                 let wait_result = winapi::um::synchapi::WaitForSingleObject(handle, 0);
@@ -636,10 +654,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 } else {
                     println!("Parent process {} has terminated. Exiting.", parent_pid);
+                    gui = startt::find_most_recent_gui_apps(
+                        &file.to_string_lossy(),
+                        1,
+                        Some(parent_pid),
+                        Some(launching_pid),
+                    );
                 }
                 CloseHandle(handle);
             } else {
                 println!("Parent process {} has terminated. Exiting.", parent_pid);
+                gui = startt::find_most_recent_gui_apps(
+                    &file.to_string_lossy(),
+                    1,
+                    Some(parent_pid),
+                    Some(launching_pid),
+                );
             }
         }
         // Create grid state if needed
@@ -666,6 +696,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         // --- Parent window(s) ---
+        // let mut shake_handles = Vec::new();
         for (i, (hwnd, pid, class_name, bounds)) in gui.clone().into_iter().enumerate() {
             println!(
                 "{}. HWND = {:?}, PID = {}, Class = {}, Bounds = {:?}",
@@ -711,10 +742,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("Shaking window: {:?}", hwnd);
                 // Shake the window in a non-blocking way (spawn a thread)
                 let hwnd_copy = hwnd as isize;
-                std::thread::spawn(move || {
+                // Spawn the shake thread and collect the JoinHandle
+                let shake_handle = std::thread::spawn(move || {
                     let hwnd = hwnd_copy as HWND;
-                    shake_window(hwnd, 10, 2000);
+                    shake_window(hwnd, 10, SHAKE_DURATION);
                 });
+                shake_handles.push(shake_handle);
 
                 if was_minimized {
                     println!("Re-minimizing window: {:?}", hwnd);
@@ -727,18 +760,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if gui.is_empty() {
             // Find the HWND using the real PID
-            let hwnd = find_hwnd_by_pid(parent_pid).ok_or_else(|| {
+            if let Some(hwnd) = find_hwnd_by_pid(parent_pid) {
+                println!("Found HWND = {:?}", hwnd);
+                // Shake the window in a non-blocking way (spawn a thread)
+                let hwnd_copy = hwnd as isize;
+                let shake_handle = std::thread::spawn(move || {
+                    let hwnd = hwnd_copy as HWND;
+                    shake_window(hwnd, 10, SHAKE_DURATION);
+                });
+                shake_handles.push(shake_handle);
+                parent_hwnd = Some(hwnd);
+            } else {
                 eprintln!("Failed to find HWND for PID {}", parent_pid);
-                std::io::Error::new(std::io::ErrorKind::NotFound, "HWND not found")
-            })?;
-            println!("Found HWND = {:?}", hwnd);
-            // Shake the window in a non-blocking way (spawn a thread)
-            let hwnd_copy = hwnd as isize;
-            std::thread::spawn(move || {
-                let hwnd = hwnd_copy as HWND;
-                shake_window(hwnd, 10, 2000);
-            });
-            parent_hwnd = Some(hwnd);
+                // Do not return early, just continue
+            }
         }
 
         // Track which child HWNDs we've already shaken to avoid repeats
@@ -774,24 +809,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             println!("Child PIDs (snapshot + ETW): {:?}", child_pids);
-            // Check if any tracked process is still running
-            let mut any_alive = false;
-            let mut all_pids = vec![parent_pid];
-            all_pids.extend(child_pids.iter().copied());
-            for pid in all_pids {
-                let handle = OpenProcess(winapi::um::winnt::SYNCHRONIZE, 0, pid);
-                if !handle.is_null() {
-                    let wait_result = winapi::um::synchapi::WaitForSingleObject(handle, 0);
-                    CloseHandle(handle);
-                    if wait_result != winapi::um::winbase::WAIT_OBJECT_0 {
-                        any_alive = true;
-                        break;
+
+            if !follow_forver {
+                // Check if any tracked process is still running
+                let mut any_alive = false;
+                let mut all_pids = vec![parent_pid];
+                all_pids.extend(child_pids.iter().copied());
+                for pid in all_pids {
+                    let handle = OpenProcess(winapi::um::winnt::SYNCHRONIZE, 0, pid);
+                    if !handle.is_null() {
+                        let wait_result = winapi::um::synchapi::WaitForSingleObject(handle, 0);
+                        CloseHandle(handle);
+                        if wait_result != winapi::um::winbase::WAIT_OBJECT_0 {
+                            any_alive = true;
+                            break;
+                        }
                     }
                 }
-            }
-            if !any_alive {
-                println!("All tracked processes have terminated. Exiting.");
-                break;
+                if !any_alive {
+                    println!("All tracked processes have terminated. Exiting.");
+                    break;
+                }
             }
 
             let mut _new_hwnds: Vec<HWND> = Vec::new();
@@ -909,7 +947,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let hwnd_copy = hwnd as isize;
                 std::thread::spawn(move || {
                     let hwnd = hwnd_copy as HWND;
-                    shake_window(hwnd, 10, 2000);
+                    shake_window(hwnd, 10, SHAKE_DURATION);
                 });
                 shaken_hwnds.insert(hwnd);
             }
@@ -929,6 +967,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         winapi::um::handleapi::CloseHandle(sei.hProcess);
     }
+    println!(
+        "Waiting for shake threads to finish... {}",
+        shake_handles.len()
+    );
+    for handle in shake_handles {
+        let _ = handle.join();
+    }
+    println!("All shake threads finished.");
 
     Ok(())
 }

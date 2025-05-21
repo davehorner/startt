@@ -318,6 +318,8 @@ pub fn filetime_to_unix_time(ft: FILETIME) -> u64 {
 pub fn find_most_recent_gui_apps(
     program_name: &str,
     num_recent: usize,
+    _parent_pid: Option<DWORD>,
+    _launching_pid: Option<DWORD>,
 ) -> Vec<(HWND, u32, String, (i32, i32, i32, i32))> {
     unsafe {
         struct EnumData {

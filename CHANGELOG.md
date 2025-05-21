@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5](https://github.com/davehorner/startt/compare/v0.1.4...v0.1.5) - 2025-05-21
+
+### Fixed
+
+- regression fix for non-follow url shaking.  -F --follow-forever for
+
 ## [0.1.4](https://github.com/davehorner/startt/compare/v0.1.3...v0.1.4) - 2025-05-20
 
 ### Added
