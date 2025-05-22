@@ -29,10 +29,11 @@ This initial proof of concept implementation of `startt`:
 
 **Usage:**
 ```
-startt [-f|--follow] [-g ROWSxCOLS|--grid ROWSxCOLS] <executable|document|URL> [args...]
+startt [-f|--follow] [-F|--follow-forever] [-g ROWSxCOLS|--grid ROWSxCOLS] [-t SECONDS|--timeout SECONDS] <executable|document|URL> [args...]
 ```
 - Use `-f` or `--follow` to keep watching for and shaking new child windows.
 - Use `-F` or `--follow-forever` to keep watching for and shaking new child windows even after the parent has closed.
+- Use `-t SECONDS` or `--timeout SECONDS` to specify the number of seconds each window should remain open before a quit message is sent to it. Each window is tracked individually; after the timeout, `startt` will send a WM_CLOSE message to that window.
 - Use `-g ROWSxCOLS` or `--grid ROWSxCOLS` to tile each window into a grid on the primary monitor (e.g., `-g 2x2` for a 2x2 grid).
 - Specify a monitor with `-g ROWSxCOLSmN` (e.g., `-g 2x2m1` for monitor 1, zero-based). `-gROWSxCOLSm#` is also valid.
 
@@ -41,9 +42,9 @@ startt [-f|--follow] [-g ROWSxCOLS|--grid ROWSxCOLS] <executable|document|URL> [
 startt was developed for use with [cargo-e](https://crates.io/crates/cargo-e) but can be used with any application that pops a window on windows.
 
 ```
-startt -f -g1x4 cargo-e --run-all --run-at-a-time 4
+startt -f -g1x4 -t 10 cargo-e --run-all --run-at-a-time 4
 ```
-
+This will shake and grid each window, and after 10 seconds, send a quit message to each window.
 [![startt + cargo-e + bevy](https://github.com/davehorner/cargo-e_walkthrus/raw/main/startt_cargo-e_bevy_runall_4x1.gif)](https://github.com/davehorner/cargo-e_walkthrus/tree/main)
 
 
