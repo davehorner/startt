@@ -1,1 +1,10 @@
-﻿25/05/20|f5bba21|0.1.5
+﻿25/05/22|315072d|0.1.6
+## [0.1.6](https://github.com/davehorner/startt/compare/v0.1.5...v0.1.6) - 2025-05-22
+
+### Added
+
+- add --timeout/-t option to close windows after specified seconds
+
+### Other
+
+- update README.md with additional usage examples and usage notes

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6](https://github.com/davehorner/startt/compare/v0.1.5...v0.1.6) - 2025-05-22
+
+### Added
+
+- add --timeout/-t option to close windows after specified seconds
+
+### Other
+
+- update README.md with additional usage examples and usage notes
+
 ## [0.1.5](https://github.com/davehorner/startt/compare/v0.1.4...v0.1.5) - 2025-05-21
 
 ### Fixed

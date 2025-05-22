@@ -1,0 +1,6 @@
+target/
+1install_err.txt
+1install_out.txt
+output*
+run_report.md
+.bacon-locations
