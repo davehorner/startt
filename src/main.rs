@@ -7,6 +7,7 @@ use ferrisetw::parser::Parser;
 use ferrisetw::trace::UserTrace;
 #[cfg(feature = "uses_etw")]
 use ferrisetw::{EventRecord, SchemaLocator};
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::env;
 use std::ffi::OsString;
@@ -15,7 +16,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use widestring::U16CString;
 use winapi::shared::minwindef::FALSE;
 use winapi::shared::windef::HWND;
@@ -440,7 +441,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut follow_children = false;
     let mut follow_forver = false;
     let mut positional_args = Vec::new();
-
+    let mut timeout_secs: Option<u64> = None;
+    let mut hwnd_start_times: HashMap<HWND, Instant> = HashMap::new();
     let mut args = env::args_os().skip(1).peekable();
     while let Some(arg) = args.next() {
         let arg_str = arg.to_string_lossy();
@@ -463,6 +465,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (rows, cols, monitor) = parse_grid_arg(grid_str);
             grid = Some((rows, cols, monitor));
             println!("Grid set to {}x{} on monitor {}", rows, cols, monitor);
+        } else if arg_str == "-t" || arg_str == "--timeout" {
+            let t_arg = args
+                .next()
+                .expect("Expected number of seconds after -t/--timeout");
+            timeout_secs = Some(
+                t_arg
+                    .to_string_lossy()
+                    .parse()
+                    .expect("Invalid timeout value"),
+            );
         } else {
             positional_args.push(arg);
             // Push the rest as positional args
@@ -557,7 +569,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let launching_pid = get_parent_pid(std::process::id()).unwrap_or(0);
         println!("Launching PID (parent of this process): {}", launching_pid);
         let parent_pid = GetProcessId(sei.hProcess);
-        let mut parent_hwnd = None;
+        let parent_hwnd = Arc::new(Mutex::new(None::<isize>));
         // After launching the process and getting parent_pid:
         let tracked_pids = Arc::new(Mutex::new(HashSet::new()));
 
@@ -573,7 +585,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             let running = running.clone();
             let tracked_pids_for_ctrlc = tracked_pids.clone();
+            let parent_hwnd_for_ctrlc = parent_hwnd.clone();
             ctrlc::set_handler(move || {
+                let hwnd_opt = parent_hwnd_for_ctrlc.lock().unwrap();
+                println!(
+                    "Ctrl+C reached for parent HWND {:?}, sending WM_CLOSE",
+                    *hwnd_opt
+                );
+                unsafe {
+                    if let Some(hwnd_isize) = *hwnd_opt {
+                        let hwnd = hwnd_isize as HWND;
+                        // Send WM_CLOSE to the parent window
+                        winapi::um::winuser::SendMessageW(
+                            hwnd,
+                            winapi::um::winuser::WM_CLOSE,
+                            0,
+                            0,
+                        );
+                    }
+                }
+
                 println!("\nCtrl+C pressed! Killing all child processes...");
                 running.store(false, Ordering::SeqCst);
                 let mut child_pids = get_child_pids(parent_pid);
@@ -634,8 +665,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         parent_pid
                     );
                     if let Some(hwnd) = find_hwnd_by_pid(parent_pid) {
-                        println!("Using parent HWND found by PID: {:?}", hwnd);
-                        parent_hwnd = Some(hwnd);
+                        {
+                            let mut phwnd = parent_hwnd.lock().unwrap();
+                            *phwnd = Some(hwnd as isize);
+                        }
                         // Set gui to contain the found parent_hwnd so later logic works as expected
                         // Get the real bounds for the found parent_hwnd
                         let mut rect = std::mem::zeroed();
@@ -738,7 +771,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
 
-                parent_hwnd = Some(hwnd);
+                {
+                    let mut phwnd = parent_hwnd.lock().unwrap();
+                    *phwnd = Some(hwnd as isize);
+                }
                 println!("Shaking window: {:?}", hwnd);
                 // Shake the window in a non-blocking way (spawn a thread)
                 let hwnd_copy = hwnd as isize;
@@ -753,6 +789,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("Re-minimizing window: {:?}", hwnd);
                     ShowWindow(hwnd, SW_MINIMIZE);
                 }
+                // if !hwnd_start_times.contains_key(&hwnd) {
+                //     hwnd_start_times.insert(hwnd, Instant::now());  // maybe a --time-out-all in the future?
+                // }
             } else {
                 eprintln!("Failed to get window placement for HWND {:?}", hwnd);
             }
@@ -769,7 +808,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     shake_window(hwnd, 10, SHAKE_DURATION);
                 });
                 shake_handles.push(shake_handle);
-                parent_hwnd = Some(hwnd);
+                {
+                    let mut phwnd = parent_hwnd.lock().unwrap();
+                    *phwnd = Some(hwnd as isize);
+                }
             } else {
                 eprintln!("Failed to find HWND for PID {}", parent_pid);
                 // Do not return early, just continue
@@ -857,10 +899,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             hwnd_pid_map = data.2;
 
             for (hwnd, pid) in hwnd_pid_map {
-                if shaken_hwnds.contains(&hwnd)
-                    || failed_hwnds.contains(&hwnd)
-                    || failed_pids.contains(&pid)
-                {
+                if shaken_hwnds.contains(&hwnd) {
+                    // timeout hwnd_start_times:
+                    if let Some(timeout) = timeout_secs {
+                        let now = Instant::now();
+                        let mut to_quit = Vec::new();
+                        for (&hwnd, &start) in hwnd_start_times.iter() {
+                            if now.duration_since(start).as_secs() >= timeout {
+                                to_quit.push(hwnd);
+                            }
+                        }
+                        for hwnd in to_quit {
+                            println!("Timeout reached for HWND {:?}, sending WM_CLOSE", hwnd);
+                            unsafe {
+                                winapi::um::winuser::PostMessageW(
+                                    hwnd,
+                                    winapi::um::winuser::WM_CLOSE,
+                                    0,
+                                    0,
+                                );
+                            }
+                            hwnd_start_times.remove(&hwnd);
+                        }
+                    }
+                    continue;
+                }
+
+                if failed_hwnds.contains(&hwnd) || failed_pids.contains(&pid) {
                     continue;
                 }
                 let mut rect = std::mem::zeroed();
@@ -898,10 +963,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
                 let this_parent_hwnd = winapi::um::winuser::GetParent(hwnd);
-                if Some(hwnd) == parent_hwnd {
-                    println!("skipping parent");
-                    // Skip the parent window so it is not moved again
-                    continue;
+                if let Ok(phwnd_guard) = parent_hwnd.lock() {
+                    if let Some(parent_hwnd_isize) = *phwnd_guard {
+                        if hwnd == parent_hwnd_isize as HWND {
+                            println!("skipping parent");
+                            // Skip the parent window so it is not moved again
+                            continue;
+                        }
+                    }
                 }
                 let window_type = if this_parent_hwnd.is_null() {
                     "Top-level"
@@ -950,6 +1019,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     shake_window(hwnd, 10, SHAKE_DURATION);
                 });
                 shaken_hwnds.insert(hwnd);
+                if !hwnd_start_times.contains_key(&hwnd) {
+                    hwnd_start_times.insert(hwnd, Instant::now());
+                }
             }
 
             sleep(Duration::from_millis(2000));

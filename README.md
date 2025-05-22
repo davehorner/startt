@@ -10,7 +10,7 @@ or anything that calls `ShellExecuteEx` under the covers (even with `SEE_MASK_NO
 
 This initial proof of concept implementation of `startt`:
 
-- **Launches** your file/URL/command via `ShellExecuteExW(SEE_MASK_NOCLOSEPROCESS)`  
+- **Launches** your file/URL/command via `ShellExecuteExW(SEE_MASK_NOCLOSEPROCESS)`
 - **Blocks** until the new process is idle (`WaitForInputIdle`)  
 - **Snapshots** all child processes (`Toolhelp32Snapshot`) to catch helpers  
 - **Enumerates** top-level windows (`EnumWindows`) and filters by PID or child-PID  
@@ -19,33 +19,39 @@ This initial proof of concept implementation of `startt`:
 - **Restores** minimized windows if needed, and reports both parent and child PIDs
 - **Reports** both parent and child PIDs
 - **Ranks** remaining candidates by process **creation time**, selecting the most recent  
-- **Filters** candidates by:
+- **Filters** candidates by a few things look at the code:
   - **PID match** (parent or any child PID)  
   - **Executable name** contains the target command/document name  
 - **Optionally follows and shakes child windows** with the `-f` or `--follow` flag:
   - When `-f` is specified, `startt` will continue to monitor for new child processes/windows spawned by the launched process, and shake each new window once as it appears.  
   - This is useful for apps that spawn additional windows after startup (e.g., browsers, editors, etc.).
 
-Because it uses only Win32 APIs (`OpenProcess`, `GetProcessImageFileNameW`, `GetProcessTimes`, `EnumWindows`, etc.), it works for _any_ “start”-style invocation—making it perfect for scripts, CI jobs, or demo tooling where you need to programmatically find and manipulate the window/app you just opened.
 
 **Usage:**
 ```
 startt [-f|--follow] [-g ROWSxCOLS|--grid ROWSxCOLS] <executable|document|URL> [args...]
 ```
 - Use `-f` or `--follow` to keep watching for and shaking new child windows.
+- Use `-F` or `--follow-forever` to keep watching for and shaking new child windows even after the parent has closed.
 - Use `-g ROWSxCOLS` or `--grid ROWSxCOLS` to tile each window into a grid on the primary monitor (e.g., `-g 2x2` for a 2x2 grid).
-- You can also specify a monitor with `-g ROWSxCOLSmN` (e.g., `-g 2x2m1` for monitor 1, zero-based).
+- Specify a monitor with `-g ROWSxCOLSmN` (e.g., `-g 2x2m1` for monitor 1, zero-based). `-gROWSxCOLSm#` is also valid.
 
 **Examples:**
-```
-startt -f -g2x2 cargo e --run-all 10
-```
+
+startt was developed for use with [cargo-e](https://crates.io/crates/cargo-e) but can be used with any application that pops a window on windows.
 
 ```
-REM cmd.exe
-REM I hope you have a wide monitor.
-startt -f -g1x5 cmd /k "for %i in (0 1 2 3 4) do start powershell -NoProfile -Command \"$host.ui.RawUI.WindowTitle = 'Prompt %i PID=' + $PID; echo Prompt %i PID=$PID; Start-Sleep -Seconds 99999\""
+startt -f -g1x4 cargo-e --run-all --run-at-a-time 4
 ```
+
+[![startt + cargo-e + bevy](https://github.com/davehorner/cargo-e_walkthrus/raw/main/startt_cargo-e_bevy_runall_4x1.gif)](https://github.com/davehorner/cargo-e_walkthrus/tree/main)
+
+
+works with commands that are detached as demonstrated by cmd.exe start.
+```
+startt -f -g1x5 cmd /c "start \"parent\" cmd /k echo parent & start \"1\" cmd /k echo 1 & start \"2\" cmd /k echo 2 & start \"3\" cmd /k echo 3 & start \"4\" cmd /k echo 4"
+```
+maybe you prefer some other program.
 ```
 # powershell
 startt -f -g1x5 powershell -NoProfile -WindowStyle Normal -Command "1..5 | ForEach-Object { Start-Process powershell -ArgumentList '-NoProfile','-Command','$host.ui.RawUI.WindowTitle = \"Prompt $_ PID=\" + $PID; Write-Host Prompt $_ PID=$PID; Start-Sleep -Seconds 99999' }; Start-Sleep -Seconds 99999"
@@ -64,8 +70,11 @@ See also:
 
 **startt solves the problem of finding the hwnd and process id of a command or url that is launched by cmd.exe /c start, explorer <url>, start-process, or anything that calls shellexecuteex under the covers.**
 
-its rough around the edges and not intended for any purpose but demonstration.
-it shakes the 1st found window;  tested with chrome, vscode, mpv, msedge, cmd.
+still rough around the edges and not intended for any purpose but demonstration.  the lib interface is subject to change - SEMVER rules will be applied.
+
+it shakes the 1st found window; moves windows in grids; kills all child processes on ctrl+c;
+
+tested with chrome, vscode, mpv, msedge, cmd.  Your application, mileage, and use case may vary. If you find a problem; take a look at the code, PRs and polite discussion are welcome.
 
 --dave horner  
 5/25
