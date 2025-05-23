@@ -464,6 +464,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args_os().skip(1).peekable();
     let mut shake_duration: u64 = 2000; // default 2000ms
     let mut fit_grid = false;
+    let mut reserve_parent_cell = false;
+    let mut assign_parent_cell: Option<(u32, u32, Option<i32>)> = None;
     while let Some(arg) = args.next() {
         let arg_str = arg.to_string_lossy();
         if arg_str == "-f" || arg_str == "--follow" {
@@ -511,6 +513,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .expect("Invalid shake duration value");
         } else if arg_str == "--fit-grid" || arg_str == "-fg" {
             fit_grid = true;
+        } else if arg_str == "--reserve-parent-cell" || arg_str == "-rpc" {
+            reserve_parent_cell = true;
+        } else if arg_str == "--assign-parent-cell" || arg_str == "-apc" {
+            if let Some(cell_arg) = args.peek() {
+                let cell_str = cell_arg.to_string_lossy().to_string();
+                if cell_str.contains('x') {
+                    args.next(); // consume
+                    let (rc, m) = if let Some(idx) = cell_str.find('m') {
+                        (&cell_str[..idx], Some(&cell_str[idx + 1..]))
+                    } else {
+                        (cell_str.as_str(), None)
+                    };
+                    let parts: Vec<&str> = rc.split('x').collect();
+                    if parts.len() == 2 {
+                        if let (Ok(row), Ok(col)) = (parts[0].parse(), parts[1].parse()) {
+                            let monitor = m.and_then(|s| s.parse::<i32>().ok());
+                            assign_parent_cell = Some((row, col, monitor));
+                        }
+                    }
+                } else {
+                    assign_parent_cell = Some((0, 0, None));
+                }
+            } else {
+                assign_parent_cell = Some((0, 0, None));
+            }
         } else {
             positional_args.push(arg);
             // Push the rest as positional args
@@ -522,7 +549,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = positional_args.into_iter();
     let mut file = args
         .next()
-        .expect("Usage: startt [-f] [-g ROWSxCOLSmDISPLAY#] <executable|document|URL> [args...]");
+        .expect("Usage: startt [-f] [-g ROWSxCOLS or ROWSxCOLSmDISPLAY#] <executable|document|URL> [args...]");
 
     // Reconstruct the parameter string (everything after the first token)
     let mut params = args
@@ -790,68 +817,112 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ShowWindow(hwnd, SW_RESTORE);
                     sleep(Duration::from_millis(500));
                 }
+                // Remove border/title bar first
+                if should_hide_border {
+                    println!("Hiding border for HWND {:?}", hwnd);
+                    hide_window_border(hwnd);
+                }
+                if should_hide_title_bar {
+                    println!("Hiding title bar for HWND {:?}", hwnd);
+                    hide_window_title_bar(hwnd);
+                }
+                if i == 0 {
+                    // This is the parent window, assign to the specified cell if requested
 
-                // Move to grid cell if grid is enabled
-                if let Some(ref mut grid_state) = grid_state {
-                    // Remove border/title bar first
-                    if should_hide_border {
-                        println!("Hiding border for HWND {:?}", hwnd);
-                        hide_window_border(hwnd);
-                    }
-                    if should_hide_title_bar {
-                        println!("Hiding title bar for HWND {:?}", hwnd);
-                        hide_window_title_bar(hwnd);
-                    }
-
-                    // Now get the new window rect (frame may have changed)
-                    let mut rect = std::mem::zeroed();
-                    if winapi::um::winuser::GetWindowRect(hwnd, &mut rect) != 0 {
-                        let win_width = rect.right - rect.left;
-                        let win_height = rect.bottom - rect.top;
-                        let (mut new_x, mut new_y) = grid_state.next_position(win_width, win_height, fit_grid);
-
-                        // Clamp as before
-                        let min_x = grid_state.monitor_rect.left;
-                        let min_y = grid_state.monitor_rect.top;
-                        let max_x = grid_state.monitor_rect.right - if fit_grid { 
-                            (grid_state.monitor_rect.right - grid_state.monitor_rect.left) / grid_state.cols as i32 
-                        } else { win_width };
-                        let max_y = grid_state.monitor_rect.bottom - if fit_grid { 
-                            (grid_state.monitor_rect.bottom - grid_state.monitor_rect.top) / grid_state.rows as i32 
-                        } else { win_height };
-                        new_x = new_x.clamp(min_x, max_x);
-                        new_y = new_y.clamp(min_y, max_y);
-
+                    let (parent_row, parent_col, parent_monitor_opt) =
+                        assign_parent_cell.unwrap_or((0, 0, None));
+                    let parent_monitor = parent_monitor_opt
+                        .unwrap_or_else(|| grid_state.as_ref().map(|g| g.monitor).unwrap_or(0));
+                    let monitor_rect = get_monitor_rect(parent_monitor);
+                    let cell_w = (monitor_rect.right - monitor_rect.left)
+                        / grid_state.as_ref().unwrap().cols as i32;
+                    let cell_h = (monitor_rect.bottom - monitor_rect.top)
+                        / grid_state.as_ref().unwrap().rows as i32;
+                    let new_x = monitor_rect.left + parent_col as i32 * cell_w;
+                    let new_y = monitor_rect.top + parent_row as i32 * cell_h;
+                    println!(
+                        "Assigning parent HWND {:?} to cell ({}, {}, monitor {}) at ({}, {}) size=({}, {})",
+                        hwnd, parent_row, parent_col, parent_monitor, new_x, new_y, cell_w, cell_h
+                    );
+                    SetWindowPos(
+                        hwnd,
+                        std::ptr::null_mut(),
+                        new_x,
+                        new_y,
+                        if fit_grid && !is_console { cell_w } else { 0 },
+                        if fit_grid && !is_console { cell_h } else { 0 },
                         if fit_grid && !is_console {
-                            let cell_w = (grid_state.monitor_rect.right - grid_state.monitor_rect.left) / grid_state.cols as i32;
-                            let cell_h = (grid_state.monitor_rect.bottom - grid_state.monitor_rect.top) / grid_state.rows as i32;
-                            println!(
-                                "Resizing and moving HWND {:?} to grid cell: ({}, {}) size=({}, {})",
-                                hwnd, new_x, new_y, cell_w, cell_h
-                            );
-                            SetWindowPos(
-                                hwnd,
-                                std::ptr::null_mut(),
-                                new_x,
-                                new_y,
-                                cell_w,
-                                cell_h,
-                                SWP_NOZORDER,
-                            );
+                            SWP_NOZORDER
                         } else {
-                            println!(
-                                "Moving HWND {:?} to grid cell: ({}, {}) size=({}, {})",
-                                hwnd, new_x, new_y, win_width, win_height
-                            );
-                            SetWindowPos(
-                                hwnd,
-                                std::ptr::null_mut(),
-                                new_x,
-                                new_y,
-                                0,
-                                0,
-                                SWP_NOSIZE | SWP_NOZORDER,
-                            );
+                            SWP_NOSIZE | SWP_NOZORDER
+                        },
+                    );
+                } else {
+                    // Move to grid cell if grid is enabled
+                    if let Some(ref mut grid_state) = grid_state {
+                        // Now get the new window rect (frame may have changed)
+                        let mut rect = std::mem::zeroed();
+                        if winapi::um::winuser::GetWindowRect(hwnd, &mut rect) != 0 {
+                            let win_width = rect.right - rect.left;
+                            let win_height = rect.bottom - rect.top;
+                            let (mut new_x, mut new_y) =
+                                grid_state.next_position(win_width, win_height, fit_grid);
+
+                            // Clamp as before
+                            let min_x = grid_state.monitor_rect.left;
+                            let min_y = grid_state.monitor_rect.top;
+                            let max_x = grid_state.monitor_rect.right
+                                - if fit_grid {
+                                    (grid_state.monitor_rect.right - grid_state.monitor_rect.left)
+                                        / grid_state.cols as i32
+                                } else {
+                                    win_width
+                                };
+                            let max_y = grid_state.monitor_rect.bottom
+                                - if fit_grid {
+                                    (grid_state.monitor_rect.bottom - grid_state.monitor_rect.top)
+                                        / grid_state.rows as i32
+                                } else {
+                                    win_height
+                                };
+                            new_x = new_x.clamp(min_x, max_x);
+                            new_y = new_y.clamp(min_y, max_y);
+
+                            if fit_grid && !is_console {
+                                let cell_w = (grid_state.monitor_rect.right
+                                    - grid_state.monitor_rect.left)
+                                    / grid_state.cols as i32;
+                                let cell_h = (grid_state.monitor_rect.bottom
+                                    - grid_state.monitor_rect.top)
+                                    / grid_state.rows as i32;
+                                println!(
+                                    "Resizing and moving HWND {:?} to grid cell: ({}, {}) size=({}, {})",
+                                    hwnd, new_x, new_y, cell_w, cell_h
+                                );
+                                SetWindowPos(
+                                    hwnd,
+                                    std::ptr::null_mut(),
+                                    new_x,
+                                    new_y,
+                                    cell_w,
+                                    cell_h,
+                                    SWP_NOZORDER,
+                                );
+                            } else {
+                                println!(
+                                    "Moving HWND {:?} to grid cell: ({}, {}) size=({}, {})",
+                                    hwnd, new_x, new_y, win_width, win_height
+                                );
+                                SetWindowPos(
+                                    hwnd,
+                                    std::ptr::null_mut(),
+                                    new_x,
+                                    new_y,
+                                    0,
+                                    0,
+                                    SWP_NOSIZE | SWP_NOZORDER,
+                                );
+                            }
                         }
                     }
                 }
@@ -1106,11 +1177,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(ref mut grid_state) = grid_state {
                     let win_width = rect.right - rect.left;
                     let win_height = rect.bottom - rect.top;
-                    let (new_x, new_y) = grid_state.next_position(win_width, win_height, fit_grid);
+                    // Get the next grid cell position and also the cell index (row, col)
+                    let total_cells = (grid_state.rows * grid_state.cols) as usize;
+                    let cell = grid_state.next_cell % total_cells;
+                    let row = cell / grid_state.cols as usize;
+                    let col = cell % grid_state.cols as usize;
+
+                    // If reserve_parent_cell is set, skip this cell and move to the next one
+                    let (reserved_row, reserved_col) =
+                        assign_parent_cell.map(|(r, c, _)| (r, c)).unwrap_or((0, 0));
+                    let (new_x, new_y, cell_w, cell_h) = if reserve_parent_cell {
+                        if row as u32 == reserved_row && col as u32 == reserved_col {
+                            // Skip this cell, increment next_cell and get the next position
+                            grid_state.next_cell += 1;
+                            let cell = grid_state.next_cell % total_cells;
+                            let row2 = cell / grid_state.cols as usize;
+                            let col2 = cell % grid_state.cols as usize;
+                            let (nx, ny) =
+                                grid_state.next_position(win_width, win_height, fit_grid);
+                            // Optionally, print debug info
+                            println!(
+                                "Skipping reserved parent cell ({}, {}), moving to cell ({}, {})",
+                                reserved_row, reserved_col, row2, col2
+                            );
+                            (nx, ny, row2, col2)
+                        } else {
+                            let (nx, ny) =
+                                grid_state.next_position(win_width, win_height, fit_grid);
+                            (nx, ny, row, col)
+                        }
+                    } else {
+                        let (nx, ny) = grid_state.next_position(win_width, win_height, fit_grid);
+                        (nx, ny, row, col)
+                    };
 
                     if fit_grid && !is_console {
-                        let cell_w = (grid_state.monitor_rect.right - grid_state.monitor_rect.left) / grid_state.cols as i32;
-                        let cell_h = (grid_state.monitor_rect.bottom - grid_state.monitor_rect.top) / grid_state.rows as i32;
+                        let cell_w = (grid_state.monitor_rect.right - grid_state.monitor_rect.left)
+                            / grid_state.cols as i32;
+                        let cell_h = (grid_state.monitor_rect.bottom - grid_state.monitor_rect.top)
+                            / grid_state.rows as i32;
                         println!(
                             "Resizing and moving HWND {:?} to grid cell: ({}, {}) size=({}, {})",
                             hwnd, new_x, new_y, cell_w, cell_h
