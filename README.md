@@ -29,7 +29,7 @@ This initial proof of concept implementation of `startt`:
 
 **Usage:**
 ```
-startt [-f|--follow] [-F|--follow-forever] [-g ROWSxCOLS|--grid ROWSxCOLS] [-t SECONDS|--timeout SECONDS] [-hT|--hide-title-bar] [-hB|--hide-border] [-T|--flash-topmost] [-sd MILLISECONDS|--shake-duration MILLISECONDS] <executable|document|URL> [args...]
+startt [-f|--follow] [-F|--follow-forever] [-g ROWSxCOLS|--grid ROWSxCOLS] [-t SECONDS|--timeout SECONDS] [-hT|--hide-title-bar] [-hB|--hide-border] [-T|--flash-topmost] [-sd MILLISECONDS|--shake-duration MILLISECONDS] [-tc <hex>|--transparent-color <hex>] <executable|document|URL> [args...]
 ```
 - Use `-f` or `--follow` to keep watching for and shaking new child windows.
 - Use `-F` or `--follow-forever` to keep watching for and shaking new child windows even after the parent has closed.
@@ -40,6 +40,7 @@ startt [-f|--follow] [-F|--follow-forever] [-g ROWSxCOLS|--grid ROWSxCOLS] [-t S
 - Use `-hB` or `--hide-border` to hide the border of the target window.
 - Use `-T` or `--flash-topmost` to briefly set the window as topmost, then restore it.
 - Use `-sd MILLISECONDS` or `--shake-duration MILLISECONDS` to set the shake animation duration in milliseconds (default: 2000ms).
+- Use `-tc <hex>` or `--transparent-color <hex>` to set a color key for window transparency (e.g. `--transparent-color 00FF00` for green).
 
 **Examples:**
 

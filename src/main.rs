@@ -448,6 +448,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut should_hide_border = false;
     let mut args = env::args_os().skip(1).peekable();
     let mut shake_duration: u64 = 2000; // default 2000ms
+    let mut transparent_color: Option<u32> = None;
     while let Some(arg) = args.next() {
         let arg_str = arg.to_string_lossy();
         if arg_str == "-f" || arg_str == "--follow" {
@@ -493,6 +494,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .to_string_lossy()
                 .parse()
                 .expect("Invalid shake duration value");
+        } else if arg_str == "--transparent-color" || arg_str == "-tc" {
+            let color_arg = args.next().expect("Expected hex color after --transparent-color/-tc");
+            // Accepts hex like 0xRRGGBB or RRGGBB
+            let color_str = color_arg.to_string_lossy();
+            let color_str = color_str.trim_start_matches("0x");
+            transparent_color = u32::from_str_radix(color_str, 16).ok();
         } else {
             positional_args.push(arg);
             // Push the rest as positional args
@@ -793,6 +800,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let mut phwnd = parent_hwnd.lock().unwrap();
                     *phwnd = Some(hwnd as isize);
                 }
+                if let Some(color) = transparent_color {
+                    println!("Setting transparent color key: 0x{:06X} for HWND {:?}", color, hwnd);
+                    set_transparency_color(hwnd, color);
+                }
                 if should_hide_border {
                     println!("Hiding border for HWND {:?}", hwnd);
                     hide_window_border(hwnd);
@@ -831,6 +842,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Find the HWND using the real PID
             if let Some(hwnd) = find_hwnd_by_pid(parent_pid) {
                 println!("Found HWND = {:?}", hwnd);
+                if let Some(color) = transparent_color {
+                    println!("Setting transparent color key: 0x{:06X} for HWND {:?}", color, hwnd);
+                    set_transparency_color(hwnd, color);
+                }
                 if should_hide_border {
                     println!("Hiding border for HWND {:?}", hwnd);
                     hide_window_border(hwnd);
@@ -1053,6 +1068,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         SWP_NOSIZE | SWP_NOZORDER,
                     );
                 }
+                if let Some(color) = transparent_color {
+                    println!("Setting transparent color key: 0x{:06X} for HWND {:?}", color, hwnd);
+                    set_transparency_color(hwnd, color);
+                }
                 if should_hide_border {
                     println!("Hiding border for HWND {:?}", hwnd);
                     hide_window_border(hwnd);
@@ -1180,5 +1199,14 @@ fn hide_window_border(hwnd: HWND) {
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
             );
         }
+    }
+}
+
+fn set_transparency_color(hwnd: HWND, color_key: u32) {
+    use winapi::um::winuser::{GetWindowLongW, SetWindowLongW, SetLayeredWindowAttributes, GWL_EXSTYLE, WS_EX_LAYERED, LWA_COLORKEY};
+    unsafe {
+        let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
+        SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style | WS_EX_LAYERED as i32);
+        SetLayeredWindowAttributes(hwnd, color_key, 0, LWA_COLORKEY);
     }
 }
