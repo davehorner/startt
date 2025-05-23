@@ -443,7 +443,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut positional_args = Vec::new();
     let mut timeout_secs: Option<u64> = None;
     let mut hwnd_start_times: HashMap<HWND, Instant> = HashMap::new();
+    let mut should_flash_topmost = false;
+    let mut should_hide_title_bar = false;
+    let mut should_hide_border = false;
     let mut args = env::args_os().skip(1).peekable();
+    let mut shake_duration: u64 = 2000; // default 2000ms
     while let Some(arg) = args.next() {
         let arg_str = arg.to_string_lossy();
         if arg_str == "-f" || arg_str == "--follow" {
@@ -451,6 +455,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else if arg_str == "-F" || arg_str == "--follow-forver" {
             follow_children = true;
             follow_forver = true;
+        } else if arg_str == "-hT" || arg_str == "--hide-title-bar" {
+            should_hide_title_bar = true;
         } else if arg_str == "-g" || arg_str == "--grid" {
             let grid_arg = args
                 .next()
@@ -475,6 +481,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .parse()
                     .expect("Invalid timeout value"),
             );
+        } else if arg_str == "-T" || arg_str == "--flash-topmost" {
+            should_flash_topmost = true;
+        } else if arg_str == "-hB" || arg_str == "--hide-border" {
+            should_hide_border = true;
+        } else if arg_str == "--shake-duration" || arg_str == "-sd" {
+            let dur_arg = args
+                .next()
+                .expect("Expected milliseconds after --shake-duration/-sd");
+            shake_duration = dur_arg
+                .to_string_lossy()
+                .parse()
+                .expect("Invalid shake duration value");
         } else {
             positional_args.push(arg);
             // Push the rest as positional args
@@ -775,13 +793,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let mut phwnd = parent_hwnd.lock().unwrap();
                     *phwnd = Some(hwnd as isize);
                 }
+                if should_hide_border {
+                    println!("Hiding border for HWND {:?}", hwnd);
+                    hide_window_border(hwnd);
+                }
+                if should_hide_title_bar {
+                    println!("Hiding title bar for HWND {:?}", hwnd);
+                    hide_window_title_bar(hwnd);
+                }
+                if should_flash_topmost {
+                    println!("Flashing HWND {:?} as topmost for 1 second...", hwnd);
+                    flash_topmost(hwnd, 1000);
+                }
                 println!("Shaking window: {:?}", hwnd);
                 // Shake the window in a non-blocking way (spawn a thread)
                 let hwnd_copy = hwnd as isize;
                 // Spawn the shake thread and collect the JoinHandle
                 let shake_handle = std::thread::spawn(move || {
                     let hwnd = hwnd_copy as HWND;
-                    shake_window(hwnd, 10, SHAKE_DURATION);
+                    shake_window(hwnd, 10, shake_duration);
                 });
                 shake_handles.push(shake_handle);
 
@@ -801,11 +831,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Find the HWND using the real PID
             if let Some(hwnd) = find_hwnd_by_pid(parent_pid) {
                 println!("Found HWND = {:?}", hwnd);
+                if should_hide_border {
+                    println!("Hiding border for HWND {:?}", hwnd);
+                    hide_window_border(hwnd);
+                }
+                if should_hide_title_bar {
+                    println!("Hiding title bar for HWND {:?}", hwnd);
+                    hide_window_title_bar(hwnd);
+                }
+                if should_flash_topmost {
+                    println!("Flashing HWND {:?} as topmost for 1 second...", hwnd);
+                    flash_topmost(hwnd, 1000);
+                }
                 // Shake the window in a non-blocking way (spawn a thread)
                 let hwnd_copy = hwnd as isize;
                 let shake_handle = std::thread::spawn(move || {
                     let hwnd = hwnd_copy as HWND;
-                    shake_window(hwnd, 10, SHAKE_DURATION);
+                    shake_window(hwnd, 10, shake_duration);
                 });
                 shake_handles.push(shake_handle);
                 {
@@ -1011,12 +1053,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         SWP_NOSIZE | SWP_NOZORDER,
                     );
                 }
+                if should_hide_border {
+                    println!("Hiding border for HWND {:?}", hwnd);
+                    hide_window_border(hwnd);
+                }
+                if should_hide_title_bar {
+                    println!("Hiding title bar for HWND {:?}", hwnd);
+                    hide_window_title_bar(hwnd);
+                }
 
+                if should_flash_topmost {
+                    println!("Flashing HWND {:?} as topmost for 1 second...", hwnd);
+                    flash_topmost(hwnd, 1000);
+                }
                 // Shake the window in a non-blocking way (spawn a thread)
                 let hwnd_copy = hwnd as isize;
                 std::thread::spawn(move || {
                     let hwnd = hwnd_copy as HWND;
-                    shake_window(hwnd, 10, SHAKE_DURATION);
+                    shake_window(hwnd, 10, shake_duration);
                 });
                 shaken_hwnds.insert(hwnd);
                 if !hwnd_start_times.contains_key(&hwnd) {
@@ -1049,4 +1103,82 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("All shake threads finished.");
 
     Ok(())
+}
+
+fn flash_topmost(hwnd: HWND, duration_ms: u64) {
+    use winapi::um::winuser::{
+        HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetWindowPos,
+    };
+    unsafe {
+        // Set topmost
+        SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+        );
+        // Wait for the duration
+        std::thread::sleep(std::time::Duration::from_millis(duration_ms));
+        // Restore to not topmost
+        SetWindowPos(
+            hwnd,
+            HWND_NOTOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+        );
+    }
+}
+
+fn hide_window_title_bar(hwnd: HWND) {
+    use winapi::um::winuser::{
+        GWL_STYLE, GetWindowLongW, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+        SetWindowLongW, SetWindowPos, WS_CAPTION, WS_SYSMENU,
+    };
+    unsafe {
+        let style = GetWindowLongW(hwnd, GWL_STYLE);
+        // Only clear WS_CAPTION and WS_SYSMENU bits, leave others untouched
+        let new_style = style & !(WS_CAPTION as i32 | WS_SYSMENU as i32);
+        if new_style != style {
+            SetWindowLongW(hwnd, GWL_STYLE, new_style);
+            SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
+            );
+        }
+    }
+}
+
+fn hide_window_border(hwnd: HWND) {
+    use winapi::um::winuser::{
+        GWL_STYLE, GetWindowLongW, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+        SetWindowLongW, SetWindowPos, WS_BORDER, WS_THICKFRAME,
+    };
+    unsafe {
+        let style = GetWindowLongW(hwnd, GWL_STYLE);
+        // Only clear WS_THICKFRAME and WS_BORDER bits, leave others untouched
+        let new_style = style & !(WS_THICKFRAME as i32 | WS_BORDER as i32);
+        if new_style != style {
+            SetWindowLongW(hwnd, GWL_STYLE, new_style);
+            SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
+            );
+        }
+    }
 }
