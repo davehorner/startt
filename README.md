@@ -29,13 +29,14 @@ This initial proof of concept implementation of `startt`:
 
 **Usage:**
 ```
-startt [-f|--follow] [-F|--follow-forever] [-g ROWSxCOLS|--grid ROWSxCOLS] [-t SECONDS|--timeout SECONDS] [-hT|--hide-title-bar] [-hB|--hide-border] [-T|--flash-topmost] [-sd MILLISECONDS|--shake-duration MILLISECONDS] <executable|document|URL> [args...]
+startt [-f|--follow] [-F|--follow-forever] [-g ROWSxCOLS|--grid ROWSxCOLS] [-fg|--fit-grid] [-t SECONDS|--timeout SECONDS] [-hT|--hide-title-bar] [-hB|--hide-border] [-T|--flash-topmost] [-sd MILLISECONDS|--shake-duration MILLISECONDS] <executable|document|URL> [args...]
 ```
 - Use `-f` or `--follow` to keep watching for and shaking new child windows.
 - Use `-F` or `--follow-forever` to keep watching for and shaking new child windows even after the parent has closed.
 - Use `-t SECONDS` or `--timeout SECONDS` to specify the number of seconds each window should remain open before a quit message is sent to it. Each window is tracked individually; after the timeout, `startt` will send a WM_CLOSE message to that window.
 - Use `-g ROWSxCOLS` or `--grid ROWSxCOLS` to tile each window into a grid on the primary monitor (e.g., `-g 2x2` for a 2x2 grid).
 - Specify a monitor with `-g ROWSxCOLSmN` (e.g., `-g 2x2m1` for monitor 1, zero-based). `-gROWSxCOLSm#` is also valid.
+- Use `-fg` or `--fit-grid` to resize each window to exactly fit its grid cell before positioning, instead of centering at original size.
 - Use `-hT` or `--hide-title-bar` to hide the title bar of the target window.
 - Use `-hB` or `--hide-border` to hide the border of the target window.
 - Use `-T` or `--flash-topmost` to briefly set the window as topmost, then restore it.
@@ -46,11 +47,10 @@ startt [-f|--follow] [-F|--follow-forever] [-g ROWSxCOLS|--grid ROWSxCOLS] [-t S
 startt was developed for use with [cargo-e](https://crates.io/crates/cargo-e) but can be used with any application that pops a window on windows.
 
 ```
-startt -f -g1x4 -t 10 -hT -T -sd 1500 cargo-e --run-all --run-at-a-time 4
+startt -f -g1x4 -fg -t 10 -hT -T -sd 1500 cargo-e --run-all --run-at-a-time 4
 ```
-This will shake and grid each window, hide the title bar, briefly flash the window as topmost, and use a 1.5 second shake duration. After 10 seconds, a quit message is sent to each window.
+This will shake and grid each window, resize them to fit their grid cells, hide the title bar, briefly flash the window as topmost, and use a 1.5 second shake duration. After 10 seconds, a quit message is sent to each window.
 [![startt + cargo-e + bevy](https://github.com/davehorner/cargo-e_walkthrus/raw/main/startt_cargo-e_bevy_runall_4x1.gif)](https://github.com/davehorner/cargo-e_walkthrus/tree/main)
-
 
 works with commands that are detached as demonstrated by cmd.exe start.
 ```
@@ -62,7 +62,7 @@ maybe you prefer some other program.
 startt -f -g1x5 powershell -NoProfile -WindowStyle Normal -Command "1..5 | ForEach-Object { Start-Process powershell -ArgumentList '-NoProfile','-Command','$host.ui.RawUI.WindowTitle = \"Prompt $_ PID=\" + $PID; Write-Host Prompt $_ PID=$PID; Start-Sleep -Seconds 99999' }; Start-Sleep -Seconds 99999"
 ```
 
-When grid mode is enabled, each window (parent or child) is moved to the next cell in the grid, wrapping around as needed. This works for both the initial window and any new windows found in follow mode.
+When grid mode is enabled, each window (parent or child) is moved to the next cell in the grid, wrapping around as needed. With `--fit-grid`, each window is also resized to fill its cell. This works for both the initial window and any new windows found in follow mode.
 
 See also:  
 - A protocol‐handler for launching & controlling Chrome via CDP  

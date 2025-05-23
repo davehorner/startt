@@ -1,10 +1,6 @@
-﻿25/05/23|add8ab5|0.1.7
-## [0.1.7](https://github.com/davehorner/startt/compare/v0.1.6...v0.1.7) - 2025-05-23
+﻿25/05/23|d70d6d4|0.1.8
+## [0.1.8](https://github.com/davehorner/startt/compare/v0.1.7...v0.1.8) - 2025-05-23
 
 ### Added
 
-- add window manipulation options and shake duration
-
-### Fixed
-
-- lost content.
+- Add --fit-grid option for window placement and resizing
