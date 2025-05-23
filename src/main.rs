@@ -320,7 +320,7 @@ struct GridState {
 }
 
 impl GridState {
-    fn next_position(&mut self, win_width: i32, win_height: i32) -> (i32, i32) {
+    fn next_position(&mut self, win_width: i32, win_height: i32, fit_grid: bool) -> (i32, i32) {
         let total_cells = (self.rows * self.cols) as usize;
         let cell = self.next_cell % total_cells;
         self.next_cell += 1;
@@ -328,9 +328,24 @@ impl GridState {
         let col = cell % self.cols as usize;
         let cell_w = (self.monitor_rect.right - self.monitor_rect.left) / self.cols as i32;
         let cell_h = (self.monitor_rect.bottom - self.monitor_rect.top) / self.rows as i32;
-        let x = self.monitor_rect.left + col as i32 * cell_w + (cell_w - win_width) / 2;
-        let y = self.monitor_rect.top + row as i32 * cell_h + (cell_h - win_height) / 2;
-        (x, y)
+        let x = self.monitor_rect.left + col as i32 * cell_w;
+        let y = self.monitor_rect.top + row as i32 * cell_h;
+
+        if fit_grid {
+            // Top-left of cell, window will be resized to cell_w x cell_h
+            (x, y)
+        } else {
+            // Center in cell, but clamp to monitor bounds
+            let mut cx = x + (cell_w - win_width) / 2;
+            let mut cy = y + (cell_h - win_height) / 2;
+            let min_x = self.monitor_rect.left;
+            let min_y = self.monitor_rect.top;
+            let max_x = self.monitor_rect.right - win_width;
+            let max_y = self.monitor_rect.bottom - win_height;
+            cx = cx.clamp(min_x, max_x);
+            cy = cy.clamp(min_y, max_y);
+            (cx, cy)
+        }
     }
 }
 
@@ -448,6 +463,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut should_hide_border = false;
     let mut args = env::args_os().skip(1).peekable();
     let mut shake_duration: u64 = 2000; // default 2000ms
+    let mut fit_grid = false;
     while let Some(arg) = args.next() {
         let arg_str = arg.to_string_lossy();
         if arg_str == "-f" || arg_str == "--follow" {
@@ -493,6 +509,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .to_string_lossy()
                 .parse()
                 .expect("Invalid shake duration value");
+        } else if arg_str == "--fit-grid" || arg_str == "-fg" {
+            fit_grid = true;
         } else {
             positional_args.push(arg);
             // Push the rest as positional args
@@ -749,6 +767,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // --- Parent window(s) ---
         // let mut shake_handles = Vec::new();
         for (i, (hwnd, pid, class_name, bounds)) in gui.clone().into_iter().enumerate() {
+            // class_name here is a String
+            let is_console = class_name == "ConsoleWindowClass";
+
             println!(
                 "{}. HWND = {:?}, PID = {}, Class = {}, Bounds = {:?}",
                 i + 1,
@@ -772,21 +793,67 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 // Move to grid cell if grid is enabled
                 if let Some(ref mut grid_state) = grid_state {
-                    let (win_width, win_height) = (bounds.2, bounds.3);
-                    let (new_x, new_y) = grid_state.next_position(win_width, win_height);
-                    println!(
-                        "Moving HWND {:?} to grid cell: ({}, {}) size=({}, {})",
-                        hwnd, new_x, new_y, win_width, win_height
-                    );
-                    SetWindowPos(
-                        hwnd,
-                        std::ptr::null_mut(),
-                        new_x,
-                        new_y,
-                        0,
-                        0,
-                        SWP_NOSIZE | SWP_NOZORDER,
-                    );
+                    // Remove border/title bar first
+                    if should_hide_border {
+                        println!("Hiding border for HWND {:?}", hwnd);
+                        hide_window_border(hwnd);
+                    }
+                    if should_hide_title_bar {
+                        println!("Hiding title bar for HWND {:?}", hwnd);
+                        hide_window_title_bar(hwnd);
+                    }
+
+                    // Now get the new window rect (frame may have changed)
+                    let mut rect = std::mem::zeroed();
+                    if winapi::um::winuser::GetWindowRect(hwnd, &mut rect) != 0 {
+                        let win_width = rect.right - rect.left;
+                        let win_height = rect.bottom - rect.top;
+                        let (mut new_x, mut new_y) = grid_state.next_position(win_width, win_height, fit_grid);
+
+                        // Clamp as before
+                        let min_x = grid_state.monitor_rect.left;
+                        let min_y = grid_state.monitor_rect.top;
+                        let max_x = grid_state.monitor_rect.right - if fit_grid { 
+                            (grid_state.monitor_rect.right - grid_state.monitor_rect.left) / grid_state.cols as i32 
+                        } else { win_width };
+                        let max_y = grid_state.monitor_rect.bottom - if fit_grid { 
+                            (grid_state.monitor_rect.bottom - grid_state.monitor_rect.top) / grid_state.rows as i32 
+                        } else { win_height };
+                        new_x = new_x.clamp(min_x, max_x);
+                        new_y = new_y.clamp(min_y, max_y);
+
+                        if fit_grid && !is_console {
+                            let cell_w = (grid_state.monitor_rect.right - grid_state.monitor_rect.left) / grid_state.cols as i32;
+                            let cell_h = (grid_state.monitor_rect.bottom - grid_state.monitor_rect.top) / grid_state.rows as i32;
+                            println!(
+                                "Resizing and moving HWND {:?} to grid cell: ({}, {}) size=({}, {})",
+                                hwnd, new_x, new_y, cell_w, cell_h
+                            );
+                            SetWindowPos(
+                                hwnd,
+                                std::ptr::null_mut(),
+                                new_x,
+                                new_y,
+                                cell_w,
+                                cell_h,
+                                SWP_NOZORDER,
+                            );
+                        } else {
+                            println!(
+                                "Moving HWND {:?} to grid cell: ({}, {}) size=({}, {})",
+                                hwnd, new_x, new_y, win_width, win_height
+                            );
+                            SetWindowPos(
+                                hwnd,
+                                std::ptr::null_mut(),
+                                new_x,
+                                new_y,
+                                0,
+                                0,
+                                SWP_NOSIZE | SWP_NOZORDER,
+                            );
+                        }
+                    }
                 }
 
                 {
@@ -994,6 +1061,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     String::from("<unknown>")
                 };
+                let is_console = class_name_str == "ConsoleWindowClass";
                 // Skip windows with class name "NVOpenGLPbuffer" or starting with "wgpu Device Class"
                 if class_name_str == "NVOpenGLPbuffer"
                     || class_name_str.starts_with("wgpu Device Class")
@@ -1038,20 +1106,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(ref mut grid_state) = grid_state {
                     let win_width = rect.right - rect.left;
                     let win_height = rect.bottom - rect.top;
-                    let (new_x, new_y) = grid_state.next_position(win_width, win_height);
-                    println![
-                        "Moving child HWND {:?} to grid cell: ({}, {}) size=({}, {})",
-                        hwnd, new_x, new_y, win_width, win_height
-                    ];
-                    SetWindowPos(
-                        hwnd,
-                        std::ptr::null_mut(),
-                        new_x,
-                        new_y,
-                        0,
-                        0,
-                        SWP_NOSIZE | SWP_NOZORDER,
-                    );
+                    let (new_x, new_y) = grid_state.next_position(win_width, win_height, fit_grid);
+
+                    if fit_grid && !is_console {
+                        let cell_w = (grid_state.monitor_rect.right - grid_state.monitor_rect.left) / grid_state.cols as i32;
+                        let cell_h = (grid_state.monitor_rect.bottom - grid_state.monitor_rect.top) / grid_state.rows as i32;
+                        println!(
+                            "Resizing and moving HWND {:?} to grid cell: ({}, {}) size=({}, {})",
+                            hwnd, new_x, new_y, cell_w, cell_h
+                        );
+                        SetWindowPos(
+                            hwnd,
+                            std::ptr::null_mut(),
+                            new_x,
+                            new_y,
+                            cell_w,
+                            cell_h,
+                            SWP_NOZORDER,
+                        );
+                    } else {
+                        println!(
+                            "Moving child HWND {:?} to grid cell: ({}, {}) size=({}, {})",
+                            hwnd, new_x, new_y, win_width, win_height
+                        );
+                        SetWindowPos(
+                            hwnd,
+                            std::ptr::null_mut(),
+                            new_x,
+                            new_y,
+                            0,
+                            0,
+                            SWP_NOSIZE | SWP_NOZORDER,
+                        );
+                    }
                 }
                 if should_hide_border {
                     println!("Hiding border for HWND {:?}", hwnd);
