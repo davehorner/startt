@@ -12,6 +12,7 @@ or anything that calls `ShellExecuteEx` under the covers (even with `SEE_MASK_NO
 ```
 startt [options] <executable|document|URL> [args...]
 ```
+
 **Grid and cell assignment options:**
 - `-g ROWSxCOLS[ mMONITOR]` or `--grid ROWSxCOLS[ mMONITOR]`  
   Tile each window into a grid on the specified monitor (e.g., `-g 2x2m1` for a 2x2 grid on monitor 1, zero-based).
@@ -21,6 +22,12 @@ startt [options] <executable|document|URL> [args...]
   Assign the parent window to a specific grid cell and monitor (e.g., `-apc 1x1m1`). If monitor is omitted, uses the grid's monitor.
 - `-rpc` or `--reserve-parent-cell`  
   Prevents any child window from being assigned to the same grid cell as the parent window (whether default or set by `--assign-parent-cell`).
+
+**Taskbar options (experimental):**
+- `-htb` or `--hide-taskbar`  
+  Attempt to hide the Windows taskbar on the grid's monitor.
+- `-stb` or `--show-taskbar`  
+  Attempt to show the Windows taskbar on the grid's monitor.
 
 **Other options:**
 - `-f` or `--follow`  
@@ -51,13 +58,12 @@ startt -f -g1x4 -fg -t 10 -hT -T -sd 1500 cargo-e --run-all --run-at-a-time 4
 This will shake and grid each window, resize them to fit their grid cells, hide the title bar, briefly flash the window as topmost, and use a 1.5 second shake duration. After 10 seconds, a quit message is sent to each window.
 [![startt + cargo-e + bevy](https://github.com/davehorner/cargo-e_walkthrus/raw/main/startt_cargo-e_bevy_runall_4x1.gif)](https://github.com/davehorner/cargo-e_walkthrus/tree/main)
 
-works with commands that are detached as demonstrated by cmd.exe start.
+Works with commands that are detached as demonstrated by cmd.exe start:
 ```
 startt -f -g1x5 cmd /c "start \"parent\" cmd /k echo parent & start \"1\" cmd /k echo 1 & start \"2\" cmd /k echo 2 & start \"3\" cmd /k echo 3 & start \"4\" cmd /k echo 4"
 ```
-maybe you prefer some other program.
+Or use with PowerShell:
 ```
-# powershell
 startt -f -g1x5 powershell -NoProfile -WindowStyle Normal -Command "1..5 | ForEach-Object { Start-Process powershell -ArgumentList '-NoProfile','-Command','$host.ui.RawUI.WindowTitle = \"Prompt $_ PID=\" + $PID; Write-Host Prompt $_ PID=$PID; Start-Sleep -Seconds 99999' }; Start-Sleep -Seconds 99999"
 ```
 
@@ -71,14 +77,13 @@ See also:
 - PowerBasic forum thread on finding a shelled window handle  
   <https://forum.powerBasic.com/forum/user-to-user-discussions/powerbasic-for-windows/13933-finding-the-handle-of-a-shelled-window>
 
-
 **startt solves the problem of finding the hwnd and process id of a command or url that is launched by cmd.exe /c start, explorer <url>, start-process, or anything that calls shellexecuteex under the covers.**
 
-still rough around the edges and not intended for any purpose but demonstration.  the lib interface is subject to change - SEMVER rules will be applied.
+Still rough around the edges and not intended for any purpose but demonstration. The lib interface is subject to change - SEMVER rules will be applied.
 
-it shakes the 1st found window; moves windows in grids; kills all child processes on ctrl+c;
+It shakes the 1st found window; moves windows in grids; kills all child processes on ctrl+c;
 
-tested with chrome, vscode, mpv, msedge, cmd.  Your application, mileage, and use case may vary. If you find a problem; take a look at the code, PRs and polite discussion are welcome.
+Tested with chrome, vscode, mpv, msedge, cmd. Your application, mileage, and use case may vary. If you find a problem; take a look at the code, PRs and polite discussion are welcome.
 
 --dave horner  
 5/25

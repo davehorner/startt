@@ -466,6 +466,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut fit_grid = false;
     let mut reserve_parent_cell = false;
     let mut assign_parent_cell: Option<(u32, u32, Option<i32>)> = None;
+    let mut hide_taskbar = false;
+    let mut show_taskbar = false;
     while let Some(arg) = args.next() {
         let arg_str = arg.to_string_lossy();
         if arg_str == "-f" || arg_str == "--follow" {
@@ -475,6 +477,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             follow_forver = true;
         } else if arg_str == "-hT" || arg_str == "--hide-title-bar" {
             should_hide_title_bar = true;
+        } else if arg_str == "--show-taskbar" || arg_str == "-stb" {
+            show_taskbar = true;
         } else if arg_str == "-g" || arg_str == "--grid" {
             let grid_arg = args
                 .next()
@@ -483,6 +487,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (rows, cols, monitor) = parse_grid_arg(&grid_str);
             grid = Some((rows, cols, monitor));
             println!("Grid set to {}x{} on monitor {}", rows, cols, monitor);
+        } else if arg_str == "--hide-taskbar" || arg_str == "-htb" {
+            hide_taskbar = true;
         } else if arg_str.starts_with("-g") && arg_str.len() > 2 {
             // Support -g2x2 or -g2x2m1
             let grid_str = &arg_str[2..];
@@ -550,7 +556,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut file = args
         .next()
         .expect("Usage: startt [-f] [-g ROWSxCOLS or ROWSxCOLSmDISPLAY#] <executable|document|URL> [args...]");
-
+    if let Some((_, _, monitor)) = grid {
+        if hide_taskbar {
+            println!("Hiding taskbar on monitor {}", monitor);
+            hide_taskbar_on_monitor(monitor);
+        }
+        if show_taskbar {
+            println!("Showing taskbar on monitor {}", monitor);
+            show_taskbar_on_monitor(monitor);
+        }
+    }
     // Reconstruct the parameter string (everything after the first token)
     let mut params = args
         .map(|a| {
@@ -1372,5 +1387,73 @@ fn hide_window_border(hwnd: HWND) {
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
             );
         }
+    }
+}
+
+use winapi::um::winuser::{FindWindowExW, SW_HIDE, SW_SHOW};
+
+fn hide_taskbar_on_monitor(monitor_index: i32) {
+    unsafe {
+        let class_name = if monitor_index == 0 {
+            U16CString::from_str("Shell_TrayWnd").unwrap()
+        } else {
+            U16CString::from_str("Shell_SecondaryTrayWnd").unwrap()
+        };
+        // Try to find the taskbar window for the given monitor
+        let mut hwnd = FindWindowExW(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            class_name.as_ptr(),
+            std::ptr::null(),
+        );
+        // For secondary monitors, there may be multiple taskbars, so iterate
+        let mut count = 0;
+        while !hwnd.is_null() {
+            // Optionally, check which monitor this taskbar is on
+            // For now, just hide all found for this class
+            ShowWindow(hwnd, SW_HIDE);
+            count += 1;
+            hwnd = FindWindowExW(
+                std::ptr::null_mut(),
+                hwnd,
+                class_name.as_ptr(),
+                std::ptr::null(),
+            );
+        }
+        println!(
+            "Tried to hide {} taskbar window(s) for monitor {}",
+            count, monitor_index
+        );
+    }
+}
+
+fn show_taskbar_on_monitor(monitor_index: i32) {
+    unsafe {
+        let class_name = if monitor_index == 0 {
+            U16CString::from_str("Shell_TrayWnd").unwrap()
+        } else {
+            U16CString::from_str("Shell_SecondaryTrayWnd").unwrap()
+        };
+        let mut hwnd = FindWindowExW(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            class_name.as_ptr(),
+            std::ptr::null(),
+        );
+        let mut count = 0;
+        while !hwnd.is_null() {
+            ShowWindow(hwnd, SW_SHOW);
+            count += 1;
+            hwnd = FindWindowExW(
+                std::ptr::null_mut(),
+                hwnd,
+                class_name.as_ptr(),
+                std::ptr::null(),
+            );
+        }
+        println!(
+            "Tried to show {} taskbar window(s) for monitor {}",
+            count, monitor_index
+        );
     }
 }
