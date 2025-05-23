@@ -468,6 +468,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut assign_parent_cell: Option<(u32, u32, Option<i32>)> = None;
     let mut hide_taskbar = false;
     let mut show_taskbar = false;
+    let mut debug_chrome = false;
     while let Some(arg) = args.next() {
         let arg_str = arg.to_string_lossy();
         if arg_str == "-f" || arg_str == "--follow" {
@@ -479,6 +480,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             should_hide_title_bar = true;
         } else if arg_str == "--show-taskbar" || arg_str == "-stb" {
             show_taskbar = true;
+        } else if arg_str == "--debug-chrome" || arg_str == "-dbg" {
+            debug_chrome = true;
         } else if arg_str == "-g" || arg_str == "--grid" {
             let grid_arg = args
                 .next()
@@ -552,6 +555,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     println!("Arguments: {:?}", positional_args);
+    if debug_chrome {
+        let mut did_mutate = false;
+        for arg in positional_args.iter_mut() {
+            let s = arg.to_string_lossy();
+            if s.starts_with("http://") || s.starts_with("https://") {
+                let new_arg = format!("debugchrome://{}", &s);
+                *arg = OsString::from(new_arg);
+                did_mutate = true;
+            }
+        }
+        if did_mutate {
+            println!("Debug Chrome rewrite: {:?}", positional_args);
+        }
+    }
     let mut args = positional_args.into_iter();
     let mut file = args
         .next()
