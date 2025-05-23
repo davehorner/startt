@@ -1,10 +1,10 @@
-﻿25/05/22|315072d|0.1.6
-## [0.1.6](https://github.com/davehorner/startt/compare/v0.1.5...v0.1.6) - 2025-05-22
+﻿25/05/23|add8ab5|0.1.7
+## [0.1.7](https://github.com/davehorner/startt/compare/v0.1.6...v0.1.7) - 2025-05-23
 
 ### Added
 
-- add --timeout/-t option to close windows after specified seconds
+- add window manipulation options and shake duration
 
-### Other
+### Fixed
 
-- update README.md with additional usage examples and usage notes
+- lost content.
