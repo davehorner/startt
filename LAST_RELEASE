@@ -1,10 +1,6 @@
-﻿25/05/23|d2c3ba1|0.1.10
-## [0.1.10](https://github.com/davehorner/startt/compare/v0.1.9...v0.1.10) - 2025-05-23
+﻿25/05/23|90af8f0|0.1.11
+## [0.1.11](https://github.com/davehorner/startt/compare/v0.1.10...v0.1.11) - 2025-05-23
 
 ### Added
 
-- Add --hide-taskbar and --show-taskbar options
-
-### Other
-
-- forgottten update to README.md
+- *(cli)* add --debug-chrome option for URL rewriting

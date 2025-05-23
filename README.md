@@ -12,7 +12,6 @@ or anything that calls `ShellExecuteEx` under the covers (even with `SEE_MASK_NO
 ```
 startt [options] <executable|document|URL> [args...]
 ```
-
 **Grid and cell assignment options:**
 - `-g ROWSxCOLS[ mMONITOR]` or `--grid ROWSxCOLS[ mMONITOR]`  
   Tile each window into a grid on the specified monitor (e.g., `-g 2x2m1` for a 2x2 grid on monitor 1, zero-based).
@@ -23,7 +22,7 @@ startt [options] <executable|document|URL> [args...]
 - `-rpc` or `--reserve-parent-cell`  
   Prevents any child window from being assigned to the same grid cell as the parent window (whether default or set by `--assign-parent-cell`).
 
-**Taskbar options (experimental):**
+**Taskbar options:**
 - `-htb` or `--hide-taskbar`  
   Attempt to hide the Windows taskbar on the grid's monitor.
 - `-stb` or `--show-taskbar`  
@@ -44,6 +43,8 @@ startt [options] <executable|document|URL> [args...]
   Briefly set the window as topmost, then restore it.
 - `-sd MILLISECONDS` or `--shake-duration MILLISECONDS`  
   Set the shake animation duration in milliseconds (default: 2000ms).
+- `-dbg` or `--debug-chrome`  
+  Rewrite any URL arguments to use the `debugchrome://` prefix for [debugchrome-cdp-rs](https://crates.io/crates/debugchrome-cdp-rs) support.
 
 **Examples:**
 
@@ -79,11 +80,11 @@ See also:
 
 **startt solves the problem of finding the hwnd and process id of a command or url that is launched by cmd.exe /c start, explorer <url>, start-process, or anything that calls shellexecuteex under the covers.**
 
-Still rough around the edges and not intended for any purpose but demonstration. The lib interface is subject to change - SEMVER rules will be applied.
+still rough around the edges and not intended for any purpose but demonstration.  the lib interface is subject to change - SEMVER rules will be applied.
 
-It shakes the 1st found window; moves windows in grids; kills all child processes on ctrl+c;
+it shakes the 1st found window; moves windows in grids; kills all child processes on ctrl+c;
 
-Tested with chrome, vscode, mpv, msedge, cmd. Your application, mileage, and use case may vary. If you find a problem; take a look at the code, PRs and polite discussion are welcome.
+tested with chrome, vscode, mpv, msedge, cmd.  Your application, mileage, and use case may vary. If you find a problem; take a look at the code, PRs and polite discussion are welcome.
 
 --dave horner  
 5/25
