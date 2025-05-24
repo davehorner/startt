@@ -1,6 +1,6 @@
-﻿25/05/23|90af8f0|0.1.11
-## [0.1.11](https://github.com/davehorner/startt/compare/v0.1.10...v0.1.11) - 2025-05-23
+﻿25/05/24|ee736d0|0.1.12
+## [0.1.12](https://github.com/davehorner/startt/compare/v0.1.11...v0.1.12) - 2025-05-24
 
 ### Added
 
-- *(cli)* add --debug-chrome option for URL rewriting
+- *(grid)* enable full monitor area fitting and improve console resizing; consoles (cmd.exe) are special and can't do extended sizes.

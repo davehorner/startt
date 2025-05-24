@@ -350,7 +350,7 @@ impl GridState {
 }
 
 // Helper to get monitor RECT by index (0 = primary)
-fn get_monitor_rect(monitor_index: i32) -> RECT {
+fn get_monitor_rect(monitor_index: i32, use_full_area: bool) -> RECT {
     let rect = RECT {
         left: 0,
         top: 0,
@@ -367,19 +367,31 @@ fn get_monitor_rect(monitor_index: i32) -> RECT {
         lparam: winapi::shared::minwindef::LPARAM,
     ) -> i32 {
         unsafe {
-            let (target, found, rect_arc, count): &mut (
+            let (target, found, rect_arc, count, use_full_area): &mut (
                 i32,
                 Arc<Mutex<bool>>,
                 Arc<Mutex<RECT>>,
                 Arc<Mutex<i32>>,
-            ) = &mut *(lparam as *mut (i32, Arc<Mutex<bool>>, Arc<Mutex<RECT>>, Arc<Mutex<i32>>));
+                bool,
+            ) = &mut *(lparam
+                as *mut (
+                    i32,
+                    Arc<Mutex<bool>>,
+                    Arc<Mutex<RECT>>,
+                    Arc<Mutex<i32>>,
+                    bool,
+                ));
             let mut idx = count.lock().unwrap();
             if *idx == *target {
                 let mut mi: MONITORINFO = std::mem::zeroed();
                 mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
                 if GetMonitorInfoW(hmonitor, &mut mi) != 0 {
                     let mut r = rect_arc.lock().unwrap();
-                    *r = mi.rcWork;
+                    *r = if *use_full_area {
+                        mi.rcMonitor
+                    } else {
+                        mi.rcWork
+                    };
                     let mut f = found.lock().unwrap();
                     *f = true;
                 }
@@ -394,6 +406,7 @@ fn get_monitor_rect(monitor_index: i32) -> RECT {
         found.clone(),
         rect_arc.clone(),
         count.clone(),
+        use_full_area,
     );
     unsafe {
         EnumDisplayMonitors(
@@ -412,7 +425,11 @@ fn get_monitor_rect(monitor_index: i32) -> RECT {
         let mut mi: MONITORINFO = unsafe { std::mem::zeroed() };
         mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
         if unsafe { GetMonitorInfoW(hmon, &mut mi) } != 0 {
-            mi.rcWork
+            if use_full_area {
+                mi.rcMonitor
+            } else {
+                mi.rcWork
+            }
         } else {
             RECT {
                 left: 0,
@@ -764,6 +781,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let mut phwnd = parent_hwnd.lock().unwrap();
                             *phwnd = Some(hwnd as isize);
                         }
+                        let mut class_name = [0u16; 256];
+                        let class_name_len = winapi::um::winuser::GetClassNameW(
+                            hwnd,
+                            class_name.as_mut_ptr(),
+                            class_name.len() as i32,
+                        );
+                        let class_name_str = if class_name_len > 0 {
+                            OsString::from_wide(&class_name[..class_name_len as usize])
+                                .to_string_lossy()
+                                .to_string()
+                        } else {
+                            String::from("<unknown parent class>")
+                        };
+                        println!(
+                            "Found parent HWND {:?} for PID {} with class name: {}",
+                            hwnd, parent_pid, class_name_str
+                        );
                         // Set gui to contain the found parent_hwnd so later logic works as expected
                         // Get the real bounds for the found parent_hwnd
                         let mut rect = std::mem::zeroed();
@@ -774,10 +808,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 rect.right - rect.left,
                                 rect.bottom - rect.top,
                             );
-                            gui = vec![(hwnd, parent_pid, String::from("parent"), bounds)];
+                            gui = vec![(hwnd, parent_pid, class_name_str.clone(), bounds)];
                         } else {
                             // Fallback: use zero bounds if GetWindowRect fails
-                            gui = vec![(hwnd, parent_pid, String::from("parent"), (0, 0, 0, 0))];
+                            gui = vec![(hwnd, parent_pid, class_name_str.clone(), (0, 0, 0, 0))];
                         }
                     }
                 } else {
@@ -802,7 +836,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         // Create grid state if needed
         let mut grid_state: Option<GridState> = grid.map(|(rows, cols, monitor)| {
-            let monitor_rect = get_monitor_rect(monitor);
+            println!("Creating grid_state with monitor: {}", monitor);
+            let monitor_rect = get_monitor_rect(monitor, hide_taskbar);
             GridState {
                 rows,
                 cols,
@@ -860,35 +895,83 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 if i == 0 {
                     // This is the parent window, assign to the specified cell if requested
-
                     let (parent_row, parent_col, parent_monitor_opt) =
                         assign_parent_cell.unwrap_or((0, 0, None));
                     let parent_monitor = parent_monitor_opt
-                        .unwrap_or_else(|| grid_state.as_ref().map(|g| g.monitor).unwrap_or(0));
-                    let monitor_rect = get_monitor_rect(parent_monitor);
+                        .or_else(|| grid_state.as_ref().map(|g| g.monitor))
+                        .unwrap_or(0);
+                    println!(
+                        "Assigning parent: parent_monitor_opt={:?}, grid_state.monitor={}, using hide_taskbar={}",
+                        parent_monitor_opt,
+                        grid_state.as_ref().map(|g| g.monitor).unwrap_or(-1),
+                        hide_taskbar
+                    );
+                    // Only use full area if not a console window; consoles can't do that *shrug*
+                    let use_full_area = if is_console { false } else { hide_taskbar };
+                    let monitor_rect = get_monitor_rect(parent_monitor, use_full_area);
                     let cell_w = (monitor_rect.right - monitor_rect.left)
                         / grid_state.as_ref().unwrap().cols as i32;
                     let cell_h = (monitor_rect.bottom - monitor_rect.top)
                         / grid_state.as_ref().unwrap().rows as i32;
                     let new_x = monitor_rect.left + parent_col as i32 * cell_w;
                     let new_y = monitor_rect.top + parent_row as i32 * cell_h;
-                    println!(
-                        "Assigning parent HWND {:?} to cell ({}, {}, monitor {}) at ({}, {}) size=({}, {})",
-                        hwnd, parent_row, parent_col, parent_monitor, new_x, new_y, cell_w, cell_h
-                    );
-                    SetWindowPos(
-                        hwnd,
-                        std::ptr::null_mut(),
-                        new_x,
-                        new_y,
-                        if fit_grid && !is_console { cell_w } else { 0 },
-                        if fit_grid && !is_console { cell_h } else { 0 },
-                        if fit_grid && !is_console {
-                            SWP_NOZORDER
-                        } else {
-                            SWP_NOSIZE | SWP_NOZORDER
-                        },
-                    );
+
+                    if is_console && fit_grid {
+                        // Try to move/resize, fallback if it fails
+                        let mut test_h = cell_h;
+                        let min_h = 100; // Don't go below this height
+                        let mut success = false;
+                        while test_h >= min_h {
+                            SetWindowPos(
+                                hwnd,
+                                std::ptr::null_mut(),
+                                new_x,
+                                new_y,
+                                cell_w,
+                                test_h,
+                                SWP_NOZORDER,
+                            );
+                            // Give Windows a moment to apply the move
+                            sleep(Duration::from_millis(100));
+                            let mut rect = std::mem::zeroed();
+                            if winapi::um::winuser::GetWindowRect(hwnd, &mut rect) != 0 {
+                                let actual_x = rect.left;
+                                let actual_y = rect.top;
+                                let actual_h = rect.bottom - rect.top;
+                                if actual_x == new_x
+                                    && actual_y == new_y
+                                    && (actual_h - test_h).abs() < 8
+                                {
+                                    success = true;
+                                    println!(
+                                        "Console window moved and resized to height {}",
+                                        test_h
+                                    );
+                                    break;
+                                }
+                            }
+                            test_h -= 40; // Try a bit smaller
+                        }
+                        if !success {
+                            println!(
+                                "Warning: Could not fit console window to grid cell, even after shrinking."
+                            );
+                        }
+                    } else {
+                        SetWindowPos(
+                            hwnd,
+                            std::ptr::null_mut(),
+                            new_x,
+                            new_y,
+                            if fit_grid && !is_console { cell_w } else { 0 },
+                            if fit_grid && !is_console { cell_h } else { 0 },
+                            if fit_grid && !is_console {
+                                SWP_NOZORDER
+                            } else {
+                                SWP_NOSIZE | SWP_NOZORDER
+                            },
+                        );
+                    }
                 } else {
                     // Move to grid cell if grid is enabled
                     if let Some(ref mut grid_state) = grid_state {
