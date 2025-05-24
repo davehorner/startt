@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.12](https://github.com/davehorner/startt/compare/v0.1.11...v0.1.12) - 2025-05-24
+
+### Added
+
+- *(grid)* enable full monitor area fitting and improve console resizing; consoles (cmd.exe) are special and can't do extended sizes.
+
 ## [0.1.11](https://github.com/davehorner/startt/compare/v0.1.10...v0.1.11) - 2025-05-23
 
 ### Added
