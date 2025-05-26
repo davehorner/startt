@@ -654,3 +654,77 @@ pub fn find_most_recent_gui_apps(
         result
     }
 }
+
+pub fn kill_process_and_children(parent_pid: u32) {
+    use winapi::um::processthreadsapi::OpenProcess;
+    use winapi::um::winnt::PROCESS_TERMINATE;
+    use winapi::um::processthreadsapi::TerminateProcess;
+    use winapi::um::handleapi::CloseHandle;
+
+    // 1. Get all child PIDs recursively
+    let mut pids = get_child_pids(parent_pid);
+    // 2. Add the parent itself
+    pids.push(parent_pid);
+
+    // 3. Kill each process
+    for pid in pids {
+        unsafe {
+            let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+            if !handle.is_null() {
+                println!("Killing PID {}", pid);
+                TerminateProcess(handle, 1);
+                CloseHandle(handle);
+            } else {
+                println!("Failed to open PID {} for termination", pid);
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub fn get_child_pids(parent_pid: u32) -> Vec<u32> {
+    use winapi::um::tlhelp32::{
+        CreateToolhelp32Snapshot, Process32First, Process32Next, PROCESSENTRY32, TH32CS_SNAPPROCESS,
+    };
+    use winapi::shared::minwindef::FALSE;
+    use winapi::um::handleapi::CloseHandle;
+
+    let mut child_pids = Vec::new();
+    let mut stack = vec![parent_pid];
+
+    unsafe {
+        // Take a snapshot of all processes
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot.is_null() {
+            eprintln!("Failed to create process snapshot");
+            return child_pids;
+        }
+
+        let mut entry: PROCESSENTRY32 = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32>() as u32;
+
+        // Collect all process entries into a Vec for easier traversal
+        let mut all_entries = Vec::new();
+        if Process32First(snapshot, &mut entry) != FALSE {
+            loop {
+                all_entries.push(entry);
+                if Process32Next(snapshot, &mut entry) == FALSE {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snapshot);
+
+        // Use a stack for DFS to collect all descendants
+        while let Some(pid) = stack.pop() {
+            for e in all_entries.iter() {
+                if e.th32ParentProcessID == pid && !child_pids.contains(&e.th32ProcessID) {
+                    child_pids.push(e.th32ProcessID);
+                    stack.push(e.th32ProcessID);
+                }
+            }
+        }
+    }
+
+    child_pids
+}

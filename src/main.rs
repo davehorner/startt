@@ -1,3 +1,4 @@
+use dashmap::DashMap;
 // src/main.rs
 #[cfg(not(feature = "uses_etw"))]
 #[allow(unused_imports)]
@@ -7,20 +8,32 @@ use ferrisetw::parser::Parser;
 use ferrisetw::trace::UserTrace;
 #[cfg(feature = "uses_etw")]
 use ferrisetw::{EventRecord, SchemaLocator};
-use std::collections::HashMap;
-use std::collections::HashSet;
-use std::env;
+use tts::Tts;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::{BufReader, BufRead};
+use std::process::{Command, Stdio};
+use std::{env, thread};
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 use widestring::U16CString;
 use winapi::shared::minwindef::FALSE;
 use winapi::shared::windef::HWND;
 use winapi::shared::windef::{HMONITOR, POINT, RECT};
+// Window hook for automatic grid eviction on window destroy
+use winapi::um::winuser::{SetWinEventHook, EVENT_OBJECT_DESTROY, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, UnhookWinEvent};
+use winapi::shared::minwindef::{DWORD, UINT, WPARAM, LPARAM, LRESULT, BOOL, ULONG};
+use std::os::raw::c_long;
+use winapi::shared::windef::HWINEVENTHOOK;
+use once_cell::sync::OnceCell;
+
+use iceoryx2::prelude::*;
+
+// Make the publisher globally accessible
 use winapi::um::handleapi::CloseHandle;
 use winapi::um::processthreadsapi::GetProcessId;
 use winapi::um::processthreadsapi::OpenProcess;
@@ -44,6 +57,12 @@ use winapi::um::winuser::{
 unsafe extern "system" {
     fn WaitForInputIdle(hProcess: HANDLE, dwMilliseconds: u32) -> u32;
 }
+static PROGRAM_START: Lazy<Instant> = Lazy::new(Instant::now);
+// Use a thread-safe global OnceCell for grid state
+static GRID_STATE_ONCE: OnceCell<Arc<Mutex<Option<GridState>>>> = OnceCell::new();
+
+mod gui;
+use gui::StarttApp;
 
 fn get_parent_pid(pid: u32) -> Option<u32> {
     unsafe {
@@ -74,7 +93,6 @@ fn get_parent_pid(pid: u32) -> Option<u32> {
 
     None
 }
-
 fn find_hwnd_by_pid(pid: u32) -> Option<HWND> {
     struct EnumData {
         target_pid: u32,
@@ -125,47 +143,6 @@ fn find_hwnd_by_pid(pid: u32) -> Option<HWND> {
     }
 }
 
-#[allow(dead_code)]
-fn get_child_pids(parent_pid: u32) -> Vec<u32> {
-    let mut child_pids = Vec::new();
-    let mut stack = vec![parent_pid];
-
-    unsafe {
-        // Take a snapshot of all processes
-        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if snapshot.is_null() {
-            eprintln!("Failed to create process snapshot");
-            return child_pids;
-        }
-
-        let mut entry: PROCESSENTRY32 = std::mem::zeroed();
-        entry.dwSize = std::mem::size_of::<PROCESSENTRY32>() as u32;
-
-        // Collect all process entries into a Vec for easier traversal
-        let mut all_entries = Vec::new();
-        if Process32First(snapshot, &mut entry) != FALSE {
-            loop {
-                all_entries.push(entry);
-                if Process32Next(snapshot, &mut entry) == FALSE {
-                    break;
-                }
-            }
-        }
-        CloseHandle(snapshot);
-
-        // Use a stack for DFS to collect all descendants
-        while let Some(pid) = stack.pop() {
-            for e in all_entries.iter() {
-                if e.th32ParentProcessID == pid && !child_pids.contains(&e.th32ProcessID) {
-                    child_pids.push(e.th32ProcessID);
-                    stack.push(e.th32ProcessID);
-                }
-            }
-        }
-    }
-
-    child_pids
-}
 
 fn shake_window(hwnd: HWND, intensity: i32, duration_ms: u64) {
     unsafe {
@@ -310,32 +287,366 @@ fn start_etw_process_tracker_with_schema(root_pid: u32, tracked_pids: Arc<Mutex<
     }
 }
 
-// Add this struct for grid state:
+// Add this enum for grid placement mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GridPlacementMode {
+    FirstFree,
+    Sequential,
+}
+
+// Update GridState to support both modes
+#[derive(Clone)]
+struct GridCell {
+    hwnd: Option<HWND>,
+    filled_at: Option<Instant>,
+}
+
 struct GridState {
     rows: u32,
     cols: u32,
     monitor: i32,
     next_cell: usize,
     monitor_rect: RECT,
+    cells: Vec<GridCell>,
+    reserved_cell: Option<usize>,
+    filled_count: usize,
+    hwnd_to_cell: DashMap<HWND, usize>,
+    parent_cell_idx: Option<usize>,
+    parent_hwnd: isize,
+    launcher_pid: u32,
+    launcher_hwnd: isize,
+    desktop_hwnd: isize,
+    retain_parent_focus: bool,
+    retain_launcher_focus:bool,
+    has_been_filled_at_some_point: bool,
+    fit_grid: bool,
 }
 
 impl GridState {
-    fn next_position(&mut self, win_width: i32, win_height: i32, fit_grid: bool) -> (i32, i32) {
-        let total_cells = (self.rows * self.cols) as usize;
-        let cell = self.next_cell % total_cells;
-        self.next_cell += 1;
-        let row = cell / self.cols as usize;
-        let col = cell % self.cols as usize;
+
+fn with_grid_state<F, R>(f: F) -> Option<R>
+where
+    F: FnOnce(&mut GridState) -> R,
+{
+    if let Some(grid_state_arc) = GRID_STATE_ONCE.get() {
+        if let Ok(mut guard) = grid_state_arc.lock() {
+            if let Some(grid_state) = guard.as_mut() {
+                return Some(f(grid_state));
+            }
+        }
+    }
+    None
+}
+    pub fn with<F, R>(f: F) -> R
+    where
+        F: FnOnce(&mut GridState) -> R,
+    {
+        let grid_state_arc = GRID_STATE_ONCE.get().expect("GRID_STATE_ONCE not set").clone();
+        let mut guard = grid_state_arc.lock().unwrap();
+        let grid_state = guard.as_mut().expect("GridState not initialized");
+        f(grid_state)
+    }
+
+
+    /// Move the given HWND to the specified cell index, resizing if fit_grid is true.
+    /// Handles console windows with shrinking logic.
+    pub fn move_hwnd_to_cell(&self, hwnd: HWND, cell_idx: usize, fit_grid: bool) -> bool {
+        use winapi::um::winuser::{GetWindowRect, SetWindowPos, SWP_NOZORDER, SWP_NOSIZE, SW_RESTORE, ShowWindow};
+        use std::thread::sleep;
+        use std::time::Duration;
+
+        // Get cell geometry
+        let (row, col) = (cell_idx / self.cols as usize, cell_idx % self.cols as usize);
         let cell_w = (self.monitor_rect.right - self.monitor_rect.left) / self.cols as i32;
         let cell_h = (self.monitor_rect.bottom - self.monitor_rect.top) / self.rows as i32;
         let x = self.monitor_rect.left + col as i32 * cell_w;
         let y = self.monitor_rect.top + row as i32 * cell_h;
 
-        if fit_grid {
-            // Top-left of cell, window will be resized to cell_w x cell_h
-            (x, y)
+        // Get class name to check for console
+        let mut class_name = [0u16; 256];
+        let class_name_len = unsafe {
+            winapi::um::winuser::GetClassNameW(hwnd, class_name.as_mut_ptr(), class_name.len() as i32)
+        };
+        let class_name_str = if class_name_len > 0 {
+            std::ffi::OsString::from_wide(&class_name[..class_name_len as usize])
+                .to_string_lossy()
+                .to_string()
         } else {
-            // Center in cell, but clamp to monitor bounds
+            String::from("<unknown>")
+        };
+        let is_console = class_name_str == "ConsoleWindowClass";
+
+        // If minimized, restore first
+        let mut placement: winapi::um::winuser::WINDOWPLACEMENT = unsafe { std::mem::zeroed() };
+        placement.length = std::mem::size_of::<winapi::um::winuser::WINDOWPLACEMENT>() as u32;
+        if unsafe { winapi::um::winuser::GetWindowPlacement(hwnd, &mut placement) } != 0 {
+            let was_minimized = placement.showCmd == winapi::um::winuser::SW_SHOWMINIMIZED as u32;
+            if was_minimized {
+                unsafe { ShowWindow(hwnd, SW_RESTORE); }
+                sleep(Duration::from_millis(500));
+            }
+        }
+
+        let mut success = false;
+        if is_console && fit_grid {
+            // Try shrinking height if needed
+            let mut test_h = cell_h;
+            let min_h = 100;
+            while test_h >= min_h {
+                unsafe {
+                    SetWindowPos(
+                        hwnd,
+                        std::ptr::null_mut(),
+                        x,
+                        y,
+                        cell_w,
+                        test_h,
+                        SWP_NOZORDER,
+                    );
+                }
+                sleep(Duration::from_millis(100));
+                let mut rect = unsafe { std::mem::zeroed() };
+                if unsafe { GetWindowRect(hwnd, &mut rect) } != 0 {
+                    let actual_x = rect.left;
+                    let actual_y = rect.top;
+                    let actual_h = rect.bottom - rect.top;
+                    if actual_x == x && actual_y == y && (actual_h - test_h).abs() < 8 {
+                        success = true;
+                        println!("Console window moved and resized to height {}", test_h);
+                        break;
+                    }
+                }
+                test_h -= 40;
+            }
+            if !success {
+                println!("Warning: Could not fit console window to grid cell, even after shrinking.");
+            }
+        } else {
+            unsafe {
+                if fit_grid {
+                    SetWindowPos(
+                        hwnd,
+                        std::ptr::null_mut(),
+                        x,
+                        y,
+                        cell_w,
+                        cell_h,
+                        SWP_NOZORDER,
+                    );
+                } else {
+                    SetWindowPos(
+                        hwnd,
+                        std::ptr::null_mut(),
+                        x,
+                        y,
+                        0,
+                        0,
+                        SWP_NOSIZE | SWP_NOZORDER,
+                    );
+                }
+            }
+            // Verify move
+            let mut rect = unsafe { std::mem::zeroed() };
+            if unsafe { GetWindowRect(hwnd, &mut rect) } != 0 {
+                let actual_x = rect.left;
+                let actual_y = rect.top;
+                if actual_x == x && actual_y == y {
+                    success = true;
+                } else {
+                    println!(
+                        "Warning: HWND {:?} did not move to expected position (wanted: {},{} got: {},{})",
+                        hwnd, x, y, actual_x, actual_y
+                    );
+                }
+            }
+        }
+        success
+    }
+
+    /// Closes any visible, top-level, non-desktop windows at the center of each grid cell.
+    pub fn ensure_clean_desktop(&self) {
+        let cell_w = (self.monitor_rect.right - self.monitor_rect.left) / self.cols as i32;
+        let cell_h = (self.monitor_rect.bottom - self.monitor_rect.top) / self.rows as i32;
+        for (idx, _cell) in self.cells.iter().enumerate() {
+            let row = idx / self.cols as usize;
+            let col = idx % self.cols as usize;
+            let x = self.monitor_rect.left + col as i32 * cell_w + cell_w / 2;
+            let y = self.monitor_rect.top + row as i32 * cell_h + cell_h / 2;
+            let pt = winapi::shared::windef::POINT { x, y };
+            let hwnd_at_center = unsafe { winapi::um::winuser::WindowFromPoint(pt) };
+
+            // Only close if it's a real window and NOT the desktop
+            if self.is_real_window(hwnd_at_center, false) {
+                             println!(
+                    "Hiding window at cell {} center ({}, {}): HWND = {:?}",
+                    idx, x, y, hwnd_at_center
+                );
+                                unsafe {
+                    winapi::um::winuser::ShowWindow(hwnd_at_center, winapi::um::winuser::SW_HIDE);
+                }
+                // println!(
+                //     "Closing window at cell {} center ({}, {}): HWND = {:?}",
+                //     idx, x, y, hwnd_at_center
+                // );
+                // unsafe {
+                //     winapi::um::winuser::PostMessageW(
+                //         hwnd_at_center,
+                //         winapi::um::winuser::WM_CLOSE,
+                //         0,
+                //         0,
+                //     );
+                // }
+            }
+            let corners = [
+                (0, 0), // top-left
+                (0, self.cols as usize - 1), // top-right
+                (self.rows as usize - 1, 0), // bottom-left
+                (self.rows as usize - 1, self.cols as usize - 1), // bottom-right
+            ];
+            for (row, col) in corners {
+                let x = self.monitor_rect.left + col as i32 * cell_w + cell_w / 2;
+                let y = self.monitor_rect.top + row as i32 * cell_h + cell_h / 2;
+                let pt = winapi::shared::windef::POINT { x, y };
+                let hwnd_at_corner = unsafe { winapi::um::winuser::WindowFromPoint(pt) };
+                if self.is_real_window(hwnd_at_corner, false) {
+                    println!(
+                        "Hiding window at corner ({}, {}) HWND = {:?}",
+                        x, y, hwnd_at_corner
+                    );
+                    unsafe {
+                        winapi::um::winuser::ShowWindow(hwnd_at_corner, winapi::um::winuser::SW_HIDE);
+                    }
+                }
+            }
+        }
+    }
+        /// Prints which grid cells have the desktop window at their center.
+    pub fn print_desktop_cells(&self) {
+        let cell_w = (self.monitor_rect.right - self.monitor_rect.left) / self.cols as i32;
+        let cell_h = (self.monitor_rect.bottom - self.monitor_rect.top) / self.rows as i32;
+        for (idx, cell) in self.cells.iter().enumerate() {
+            let row = idx / self.cols as usize;
+            let col = idx % self.cols as usize;
+            let x = self.monitor_rect.left + col as i32 * cell_w + cell_w / 2;
+            let y = self.monitor_rect.top + row as i32 * cell_h + cell_h / 2;
+            let pt = winapi::shared::windef::POINT { x, y };
+            let hwnd_at_center = unsafe { winapi::um::winuser::WindowFromPoint(pt) };
+            let is_desktop = hwnd_at_center as isize == self.desktop_hwnd;
+
+            // Only print if it's a real window (visible, top-level, not desktop unless allowed)
+            if !self.is_real_window(hwnd_at_center, true) {
+                continue;
+            }
+
+            // Get window title
+            let mut title = [0u16; 256];
+            let title_len = unsafe {
+                winapi::um::winuser::GetWindowTextW(hwnd_at_center, title.as_mut_ptr(), title.len() as i32)
+            };
+            let title_str = if title_len > 0 {
+                std::ffi::OsString::from_wide(&title[..title_len as usize])
+                    .to_string_lossy()
+                    .to_string()
+            } else {
+                String::from("<no title>")
+            };
+
+            // Get class name
+            let mut class_name = [0u16; 256];
+            let class_name_len = unsafe {
+                winapi::um::winuser::GetClassNameW(hwnd_at_center, class_name.as_mut_ptr(), class_name.len() as i32)
+            };
+            let class_name_str = if class_name_len > 0 {
+                std::ffi::OsString::from_wide(&class_name[..class_name_len as usize])
+                    .to_string_lossy()
+                    .to_string()
+            } else {
+                String::from("<unknown>")
+            };
+
+            // Get PID
+            let mut pid: u32 = 0;
+            unsafe { winapi::um::winuser::GetWindowThreadProcessId(hwnd_at_center, &mut pid) };
+
+            // Get running time if this cell is occupied
+            let running_secs = cell.filled_at.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+
+            println!(
+                "Cell {} center ({}, {}): HWND = {:?}{} | Title: '{}' | Class: '{}' | PID: {} | Running: {}s",
+                idx,
+                x,
+                y,
+                hwnd_at_center,
+                if is_desktop { " [DESKTOP]" } else { "" },
+                title_str,
+                class_name_str,
+                pid,
+                running_secs
+            );
+        }
+    }
+
+    /// Assigns a window to a grid cell, moves/resizes it, and updates the grid.
+    /// Returns Some(cell_idx) if successful, None otherwise.
+    pub fn assign_window_to_grid_cell(
+        &mut self,
+        hwnd: HWND,
+        fit_grid: bool,
+        placement_mode: GridPlacementMode,
+        retain_parent_focus: bool,
+        retain_launcher_focus:bool,
+        timeout_secs: Option<u64>,
+    ) -> Option<usize> {
+        if let Some(&existing_idx) = self.hwnd_to_cell.get(&hwnd).as_deref() {
+            // Already assigned, don't reassign or move
+            println!("HWND {:?} is already assigned to cell {}, skipping assignment.", hwnd, existing_idx);
+            return Some(existing_idx);
+        }
+        // Find the first available cell (empty or timed out), and check time/pixel constraints before moving
+        let total_cells = self.cells.len();
+        let mut selected_cell = None;
+        let mut selected_coords = (0, 0);
+        let mut selected_idx = None;
+
+        // Get the window rect to calculate its width and height
+        let mut rect = unsafe { std::mem::zeroed() };
+        let (win_width, win_height) = if unsafe { winapi::um::winuser::GetWindowRect(hwnd, &mut rect) } != 0 {
+            (rect.right - rect.left, rect.bottom - rect.top)
+        } else {
+            // Fallback to cell size if GetWindowRect fails
+            let cell_w = (self.monitor_rect.right - self.monitor_rect.left) / self.cols as i32;
+            let cell_h = (self.monitor_rect.bottom - self.monitor_rect.top) / self.rows as i32;
+            (cell_w, cell_h)
+        };
+
+        // Try all cells (parent cell first if needed)
+        let mut try_indices = Vec::new();
+        if hwnd == self.parent_hwnd as HWND {
+            if let Some(parent_cell_idx) = self.reserved_cell {
+                try_indices.push(parent_cell_idx);
+            }
+        } else {
+            for idx in 0..total_cells {
+                if Some(idx) != self.reserved_cell {
+                    try_indices.push(idx);
+                }
+            }
+        }
+
+        for idx in try_indices {
+            if !self.is_cell_available(idx, timeout_secs) {
+            continue;
+            }
+            // Compute cell coordinates
+            let row = idx / self.cols as usize;
+            let col = idx % self.cols as usize;
+            let cell_w = (self.monitor_rect.right - self.monitor_rect.left) / self.cols as i32;
+            let cell_h = (self.monitor_rect.bottom - self.monitor_rect.top) / self.rows as i32;
+            let x = self.monitor_rect.left + col as i32 * cell_w;
+            let y = self.monitor_rect.top + row as i32 * cell_h;
+            let (cx, cy) = if fit_grid {
+            (x, y)
+            } else {
             let mut cx = x + (cell_w - win_width) / 2;
             let mut cy = y + (cell_h - win_height) / 2;
             let min_x = self.monitor_rect.left;
@@ -345,6 +656,442 @@ impl GridState {
             cx = cx.clamp(min_x, max_x);
             cy = cy.clamp(min_y, max_y);
             (cx, cy)
+            };
+
+            // Check filled_at timeout if set
+            let mut filled_time_ok = true;
+            if let Some(timeout) = timeout_secs {
+            if let Some(filled_at) = self.cells[idx].filled_at {
+                let elapsed = Instant::now().duration_since(filled_at).as_secs();
+                if elapsed < timeout {
+                filled_time_ok = false;
+                }
+            }
+            }
+            // Check that cell_pixel_owner does not return a window in hwnd_to_cell
+            let (_, _, pixel_owner_hwnd) = self.cell_pixel_owner(row as u32, col as u32).unwrap_or((idx, None, None));
+            let mut pixel_owner_ok = true;
+            if let Some(owner_hwnd) = pixel_owner_hwnd {
+            if self.hwnd_to_cell.contains_key(&owner_hwnd) {
+                pixel_owner_ok = false;
+            }
+            }
+            if filled_time_ok && pixel_owner_ok {
+            selected_cell = Some((cx, cy));
+            selected_idx = Some(idx);
+            break;
+            }
+        }
+
+        let (cell_idx, new_x, new_y) = if let (Some(idx), Some((x, y))) = (selected_idx, selected_cell) {
+            (idx, x, y)
+        } else {
+            // Fallback: use next_position as before (may evict/overlay if all cells are busy)
+            let (fallback_idx, fallback_x, fallback_y) = self.next_position(
+            win_width,
+            win_height,
+            fit_grid,
+            placement_mode,
+            );
+            // eprintln!("Warning: All grid cells are busy or failed checks, using fallback cell {}", fallback_idx);
+            // self.check_and_fix_grid_sync();
+               // Only assign if the fallback cell is actually available and not reserved
+        if self.cells.get(fallback_idx).map_or(false, |c| c.hwnd.is_none()) && Some(fallback_idx) != self.reserved_cell {
+            (fallback_idx, fallback_x, fallback_y)
+        } else {
+            eprintln!("No available grid cell found for HWND {:?}, assignment failed.", hwnd);
+            return None;
+        }
+        };
+
+        // Move/resize as before...
+        let min_x = self.monitor_rect.left;
+        let min_y = self.monitor_rect.top;
+        let max_x = self.monitor_rect.right
+            - if fit_grid {
+            (self.monitor_rect.right - self.monitor_rect.left) / self.cols as i32
+            } else {
+            win_width
+            };
+        let max_y = self.monitor_rect.bottom
+            - if fit_grid {
+            (self.monitor_rect.bottom - self.monitor_rect.top) / self.rows as i32
+            } else {
+            win_height
+            };
+        let new_x = new_x.clamp(min_x, max_x);
+        let new_y = new_y.clamp(min_y, max_y);
+
+        unsafe {
+            if fit_grid {
+                let cell_w = (self.monitor_rect.right - self.monitor_rect.left) / self.cols as i32;
+                let cell_h = (self.monitor_rect.bottom - self.monitor_rect.top) / self.rows as i32;
+                SetWindowPos(
+                    hwnd,
+                    std::ptr::null_mut(),
+                    new_x,
+                    new_y,
+                    cell_w,
+                    cell_h,
+                    SWP_NOZORDER,
+                );
+            } else {
+                SetWindowPos(
+                    hwnd,
+                    std::ptr::null_mut(),
+                    new_x,
+                    new_y,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOZORDER,
+                );
+            }
+        }
+        // After moving/resizing a window (child or parent), add this:
+        if retain_parent_focus {
+            println!("DEBUG: Retaining parent focus after window move (parent_hwnd={:?})", self.parent_hwnd);
+            unsafe { winapi::um::winuser::SetForegroundWindow(self.parent_hwnd as HWND); }
+        }
+        if retain_launcher_focus {
+            // Set focus back to the launcher window (parent's parent)
+            // Use the stored launcher_hwnd if available, otherwise fallback to GetConsoleWindow
+            if self.launcher_hwnd != 0 {
+            let launcher_hwnd = self.launcher_hwnd as HWND;
+            if !launcher_hwnd.is_null() {
+                println!(
+                "DEBUG: Retaining launcher focus after window move (launcher_hwnd={:?})",
+                launcher_hwnd
+                );
+                unsafe { winapi::um::winuser::SetForegroundWindow(launcher_hwnd); }
+            } else {
+                println!(
+                "DEBUG: launcher_hwnd is set but null, skipping SetForegroundWindow"
+                );
+            }
+            } else {
+            let launcher_hwnd = unsafe { winapi::um::wincon::GetConsoleWindow() };
+            if !launcher_hwnd.is_null() {
+                println!(
+                "DEBUG: Retaining launcher focus using console window (launcher_hwnd={:?})",
+                launcher_hwnd
+                );
+                unsafe { winapi::um::winuser::SetForegroundWindow(launcher_hwnd); }
+            } else {
+                println!(
+                "DEBUG: launcher_hwnd is zero and console window is null, cannot set focus"
+                );
+            }
+            }
+        }
+        // After moving, verify the window is at the expected position
+        let mut rect = unsafe { std::mem::zeroed() };
+        let mut success = false;
+        if unsafe { winapi::um::winuser::GetWindowRect(hwnd, &mut rect) } != 0 {
+            let actual_x = rect.left;
+            let actual_y = rect.top;
+            if actual_x == new_x && actual_y == new_y {
+            success = true;
+            }
+        }
+
+        if success {
+            // Only set the cell if it's not already mapped to another cell
+            if !self.hwnd_to_cell.contains_key(&hwnd) {
+                self.cells[cell_idx] = GridCell {
+                    hwnd: Some(hwnd),
+                    filled_at: Some(Instant::now()),
+                };
+                self.hwnd_to_cell.insert(hwnd, cell_idx);
+            }
+            if self.has_been_filled_at_some_point() {
+                if let Some(timeout) = timeout_secs {
+                    self.cells[cell_idx].start_eviction_timer(cell_idx, timeout);
+                }
+            }
+            Some(cell_idx)
+        } else {
+            eprintln!(
+            "Warning: HWND {:?} did not move to expected position (wanted: {},{}).",
+            hwnd, new_x, new_y
+            );
+            None
+        }
+    }
+    
+    pub fn set_parent_cell_locked(self, parent_cell_idx: Option<usize>, parent_hwnd: HWND) {
+        Self::with(|grid| {
+            if let Some(idx) = parent_cell_idx {
+                grid.cells[idx] = GridCell {
+                    hwnd: Some(parent_hwnd),
+                    filled_at: Some(Instant::now()),
+                };
+                grid.reserved_cell = Some(idx);
+                self.move_hwnd_to_cell(parent_hwnd, idx, self.fit_grid);
+                println!("Reserved parent cell {} for HWND {:?}", idx, parent_hwnd);
+            }
+        });
+    }
+
+    pub fn check_and_fix_grid_sync_locked() {
+        Self::with(|grid| {
+            grid.check_and_fix_grid_sync();
+        });
+    }
+}
+
+impl GridState {
+    /// Returns true if the hwnd is visible, top-level, and (optionally) not the desktop.
+    fn is_real_window(&self, hwnd: HWND, allow_desktop: bool) -> bool {
+        if hwnd.is_null() {
+            return false;
+        }
+        let is_visible = unsafe { winapi::um::winuser::IsWindowVisible(hwnd) != 0 };
+        let is_top_level = unsafe { winapi::um::winuser::GetParent(hwnd) }.is_null();
+        let is_desktop = hwnd as isize == self.desktop_hwnd;
+        is_visible && is_top_level && (allow_desktop || !is_desktop)
+    }
+
+         /// Checks if the grid's cells and hwnd_to_cell map are in sync.
+        /// Prints a warning and optionally corrects the map if out of sync.
+        fn check_and_fix_grid_sync(self: &mut GridState) {
+            use winapi::um::winuser::{WindowFromPoint};
+            let mut map_errors = 0;
+            let mut cell_errors = 0;
+
+            println!("Grid cell occupancy BEFORE: {:?}", self.cells.iter().map(|c| c.hwnd).collect::<Vec<_>>());
+            // 1. Check that every cell's hwnd is correctly mapped in hwnd_to_cell
+            let mut to_insert = Vec::new();
+            for (idx, cell) in self.cells.iter().enumerate() {
+                if let Some(hwnd) = cell.hwnd {
+                    match self.hwnd_to_cell.get(&hwnd) {
+                        Some(mapped_idx) if *mapped_idx == idx => { /* OK */ }
+                        Some(mapped_idx) => {
+                            println!("Grid sync WARNING: HWND {:?} in cell {} but mapped to cell {:?} in map", hwnd, idx, mapped_idx);
+                            map_errors += 1;
+                        }
+                        None => {
+                            println!("Grid sync WARNING: HWND {:?} in cell {} but missing from map", hwnd, idx);
+                            // Optionally fix:
+                            to_insert.push((hwnd, idx));
+                            cell_errors += 1;
+                        }
+                    }
+                }
+            }
+            for (hwnd, idx) in to_insert {
+                self.hwnd_to_cell.insert(hwnd, idx);
+            }
+
+            // 2. Check that every hwnd in the map is actually present in a cell
+            let mut to_remove = Vec::new();
+            for entry in self.hwnd_to_cell.iter() {
+                let hwnd = *entry.key();
+                let idx = *entry.value();
+                if self.cells.get(idx).and_then(|c| c.hwnd).unwrap_or(ptr::null_mut()) != hwnd {
+                    println!("Grid sync WARNING: HWND {:?} mapped to cell {} but not present in that cell", hwnd, idx);
+                    // Optionally fix:
+                    to_remove.push(hwnd);
+                    map_errors += 1;
+                }
+            }
+            for hwnd in to_remove {
+                self.hwnd_to_cell.remove(&hwnd);
+            }
+
+            // 3. (Optional) Pixel check: does the center pixel of each cell belong to the mapped HWND?
+            for (idx, cell) in self.cells.iter().enumerate() {
+                if let Some(hwnd) = cell.hwnd {
+                    let row = idx / self.cols as usize;
+                    let col = idx % self.cols as usize;
+                    let cell_w = (self.monitor_rect.right - self.monitor_rect.left) / self.cols as i32;
+                    let cell_h = (self.monitor_rect.bottom - self.monitor_rect.top) / self.rows as i32;
+                    let x = self.monitor_rect.left + col as i32 * cell_w + cell_w / 2;
+                    let y = self.monitor_rect.top + row as i32 * cell_h + cell_h / 2;
+                    let pt = POINT { x, y };
+                    let pixel_owner = unsafe { WindowFromPoint(pt) };
+                    // Only warn if the pixel is owned by a non-desktop, non-this window
+                    if pixel_owner != hwnd && pixel_owner as isize != self.desktop_hwnd {
+                        println!(
+                            "Grid sync WARNING: Cell {} HWND {:?} does not own pixel ({}, {}) (owned by {:?})",
+                            idx, hwnd, x, y, pixel_owner
+                        );
+                    }
+                }
+            }
+
+            if map_errors == 0 && cell_errors == 0 {
+                println!("Grid sync: OK");
+            } else {
+                println!("Grid sync: {} map errors, {} cell errors", map_errors, cell_errors);
+                println!("Grid cell occupancy AFTER: {:?}", self.cells.iter().map(|c| c.hwnd).collect::<Vec<_>>());
+            }
+        }
+
+    fn has_been_filled_at_some_point(&self) -> bool {
+        return self.has_been_filled_at_some_point;
+    }
+    /// Set a cell for the parent window and mark it as reserved.
+    fn set_parent_cell(&mut self, parent_cell_idx: Option<usize>, parent_hwnd: HWND) {
+        if let Some(idx) = parent_cell_idx {
+            self.cells[idx] = GridCell {
+                hwnd: Some(parent_hwnd),
+                filled_at: Some(Instant::now()),
+            };
+            self.reserved_cell = Some(idx);
+            self.move_hwnd_to_cell(parent_hwnd, idx, self.fit_grid);
+            println!("Reserved parent cell {} for HWND {:?}", idx, parent_hwnd);
+        }
+    }
+}
+
+// SAFETY: HWND is safe to send and share between threads on Windows.
+unsafe impl Send for GridCell {}
+unsafe impl Sync for GridCell {}
+unsafe impl Send for GridState {}
+unsafe impl Sync for GridState {}
+
+impl GridState {
+
+    pub fn set_has_been_filled_at_some_point(&mut self) {
+        self.has_been_filled_at_some_point = true;
+    }
+        /// Returns a Vec<(cell_idx, HWND, Option<HWND>)> for each cell:
+    /// - cell_idx: the cell index
+    /// - cell_hwnd: the HWND assigned to the cell (may be None)
+    /// - pixel_owner_hwnd: the HWND that actually owns the center pixel of the cell (may be None)
+    pub fn cell_pixel_owners(&self) -> Vec<(usize, Option<HWND>, Option<HWND>)> {
+        use winapi::um::winuser::WindowFromPoint;
+        let mut result = Vec::with_capacity(self.cells.len());
+        let cell_w = (self.monitor_rect.right - self.monitor_rect.left) / self.cols as i32;
+        let cell_h = (self.monitor_rect.bottom - self.monitor_rect.top) / self.rows as i32;
+        for (idx, cell) in self.cells.iter().enumerate() {
+            let row = idx / self.cols as usize;
+            let col = idx % self.cols as usize;
+            let x = self.monitor_rect.left + col as i32 * cell_w + cell_w / 2;
+            let y = self.monitor_rect.top + row as i32 * cell_h + cell_h / 2;
+            let pt = winapi::shared::windef::POINT { x, y };
+            let hwnd = unsafe { WindowFromPoint(pt) };
+            let pixel_owner_hwnd = if self.is_real_window(hwnd, true) { Some(hwnd) } else { None };
+            result.push((idx, cell.hwnd, pixel_owner_hwnd));
+        }
+        result
+    }
+    /// Returns (cell_idx, cell_hwnd, pixel_owner_hwnd) for a specific cell position (row, col).
+    pub fn cell_pixel_owner(&self, row: u32, col: u32) -> Option<(usize, Option<HWND>, Option<HWND>)> {
+        if row >= self.rows || col >= self.cols {
+            return None;
+        }
+        let idx = (row * self.cols + col) as usize;
+        let cell = self.cells.get(idx)?;
+        let cell_w = (self.monitor_rect.right - self.monitor_rect.left) / self.cols as i32;
+        let cell_h = (self.monitor_rect.bottom - self.monitor_rect.top) / self.rows as i32;
+        let x = self.monitor_rect.left + col as i32 * cell_w + cell_w / 2;
+        let y = self.monitor_rect.top + row as i32 * cell_h + cell_h / 2;
+        let pt = winapi::shared::windef::POINT { x, y };
+        let hwnd = unsafe { winapi::um::winuser::WindowFromPoint(pt) };
+        let pixel_owner_hwnd = if self.is_real_window(hwnd, true) { Some(hwnd) } else { None };
+        Some((idx, cell.hwnd, pixel_owner_hwnd))
+    }
+
+    fn is_cell_available(&mut self, idx: usize, timeout_secs: Option<u64>) -> bool {
+        let cell = &mut self.cells[idx];
+        
+        // Use the DashMap (hwnd_to_cell) to check if this cell's hwnd is still mapped correctly
+        if let Some(hwnd) = cell.hwnd {
+            if let Some(mapped_idx) = self.hwnd_to_cell.get(&hwnd) {
+                if *mapped_idx != idx {
+                    // The hwnd is mapped to a different cell, so free this cell
+                    *cell = GridCell { hwnd: None, filled_at: None };
+                    return true;
+                } else {
+                    return false;
+                }
+            } else {
+                // The hwnd is not in the map, so free this cell
+                *cell = GridCell { hwnd: None, filled_at: None };
+                return true;
+            }
+        }
+        if cell.hwnd.is_none() {
+            *cell = GridCell { hwnd: None, filled_at: None };
+            return true;
+        }
+        // Check if the window is still valid
+        if let Some(hwnd) = cell.hwnd {
+            unsafe {
+                if winapi::um::winuser::IsWindow(hwnd) == 0 || winapi::um::winuser::IsWindowVisible(hwnd) == 0 {
+                    // Window is gone or not visible, cell is available
+                    *cell = GridCell { hwnd: None, filled_at: None };
+                    return true;
+                }
+            }
+        }
+        // Check timeout
+        if let (Some(timeout), Some(filled_at)) = (timeout_secs, cell.filled_at) {
+            let elapsed = Instant::now().duration_since(filled_at).as_secs();
+            if elapsed >= timeout {
+                *cell = GridCell { hwnd: None, filled_at: None };
+                return true;
+            }
+        }
+        false
+    }
+    // Returns (cell_idx, x, y)
+    fn next_position(
+        &mut self,
+        win_width: i32,
+        win_height: i32,
+        fit_grid: bool,
+        placement_mode: GridPlacementMode,
+    ) -> (usize, i32, i32) {
+        let total_cells = (self.rows * self.cols) as usize;
+        let cell = match placement_mode {
+            GridPlacementMode::Sequential => {
+                let mut c = self.next_cell % total_cells;
+                // Skip reserved cell if needed
+                if let Some(reserved) = self.reserved_cell {
+                    if c == reserved {
+                        self.next_cell += 1;
+                        c = self.next_cell % total_cells;
+                    }
+                }
+                // Use c before incrementing next_cell!
+                self.next_cell += 1;
+                c
+            }
+            GridPlacementMode::FirstFree => {
+                let non_reserved = |idx: usize| Some(idx) != self.reserved_cell;
+                // Always pick the lowest-index empty, non-reserved cell
+                if let Some(idx) = self.cells.iter().enumerate().find(|(idx, c)| c.hwnd.is_none() && non_reserved(*idx)).map(|(idx, _)| idx) {
+                    idx
+                } else {
+                    // Fallback: all non-reserved cells are filled, pick any non-reserved cell
+                    let fallback = (0..total_cells).find(|idx| non_reserved(*idx)).unwrap_or(0);
+                    eprintln!("Warning: All grid cells are full, using fallback cell {}", fallback);
+                    self.set_has_been_filled_at_some_point();
+                    fallback
+                }
+            }
+        };
+        let row = cell / self.cols as usize;
+        let col = cell % self.cols as usize;
+        let cell_w = (self.monitor_rect.right - self.monitor_rect.left) / self.cols as i32;
+        let cell_h = (self.monitor_rect.bottom - self.monitor_rect.top) / self.rows as i32;
+        let x = self.monitor_rect.left + col as i32 * cell_w;
+        let y = self.monitor_rect.top + row as i32 * cell_h;
+
+        if fit_grid {
+            (cell, x, y)
+        } else {
+            let mut cx = x + (cell_w - win_width) / 2;
+            let mut cy = y + (cell_h - win_height) / 2;
+            let min_x = self.monitor_rect.left;
+            let min_y = self.monitor_rect.top;
+            let max_x = self.monitor_rect.right - win_width;
+            let max_y = self.monitor_rect.bottom - win_height;
+            cx = cx.clamp(min_x, max_x);
+            cy = cy.clamp(min_y, max_y);
+            (cell, cx, cy)
         }
     }
 }
@@ -463,29 +1210,156 @@ fn parse_grid_arg(grid_str: &str) -> (u32, u32, i32) {
     let monitor = m.and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
     (rows, cols, monitor)
 }
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+            use uiautomation::UIElement;
+            use windows::core::*;
+            use windows::Win32::UI::Accessibility::*;
+
+pub struct MyEventHandler {}
+
+impl MyEventHandler {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+use std::sync::mpsc::Sender;
+static mut HOOK_SENDER: Option<Sender<usize>> = None;
+fn main() -> windows::core::Result<()> {
+
+    // Launch egui window on the main thread
+    // Only launch egui window if --gui is present in the command line arguments
+    if env::args().any(|arg| arg == "--gui") {
+
+std::thread::spawn(move || {
+        let window = unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
+        let automation = uiautomation::UIAutomation::new().unwrap();
+        let element = automation.element_from_handle(window.into()).unwrap();
+        let rect = element.get_bounding_rectangle().unwrap();
+        println!("Window Rect = {}", rect);
+});
+
+
+
+
+        // 1. Create the channel and publisher thread
+// Move publisher creation and usage into the spawned thread to avoid sharing across threads
+let (tx, rx) = mpsc::channel::<usize>();
+
+unsafe { HOOK_SENDER = Some(tx.clone()); }
+    // --- UIAutomation integration ---
+ 
+
+std::thread::spawn(move || {
+    let node = NodeBuilder::new().create::<ipc::Service>().expect("Failed to create node");
+    let service = node
+        .service_builder(&"My/Funk/ServiceName".try_into().expect("Failed to parse service name"))
+        .publish_subscribe::<usize>()
+        .open_or_create()
+        .expect("Failed to open or create service");
+    let publisher = service.publisher_builder().create().expect("Failed to create publisher");
+
+    while let Ok(val) = rx.recv() {
+        if let Ok(sample) = publisher.loan_uninit() {
+            println!("Sending value: {}", val);
+            let sample = sample.write_payload(val);
+            let _ = sample.send();
+        }
+    }
+});
+
+        if let Some(value) = gui::fun_name() {
+            value?;
+            return Ok(());
+        }
+    }
+
+    {
+        // Start a thread to listen for messages from iceoryx2 and print them
+        std::thread::spawn(|| {
+            use iceoryx2::prelude::*;
+
+            const CYCLE_TIME: Duration = Duration::from_secs(1);
+
+            let node = match NodeBuilder::new().create::<ipc::Service>() {
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!("Failed to create node: {:?}", e);
+                    return;
+                }
+            };
+
+            let service = match node.service_builder(&"My/Funk/ServiceName".try_into().unwrap())
+                .publish_subscribe::<usize>()
+                .open_or_create()
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Failed to open or create service: {:?}", e);
+                    return;
+                }
+            };
+
+            let subscriber = match service.subscriber_builder().create() {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Failed to create subscriber: {:?}", e);
+                    return;
+                }
+            };
+            let mut tts = Tts::default().unwrap();
+            while node.wait(CYCLE_TIME).is_ok() {
+                while let Ok(Some(sample)) = subscriber.receive() {
+                    println!("received: {:?}", *sample);
+                    // For usize, just print the value directly
+                    // Only speak if the sample (HWND as usize) is present in the grid
+                    GridState::with_grid_state(|grid| {
+                        println!("Checking if sample {:?} is in grid {}", *sample, grid.hwnd_to_cell.len());
+                        let hwnd = *sample as winapi::shared::windef::HWND;
+                        if grid.hwnd_to_cell.contains_key(&hwnd) {
+                            println!("TTS: {}", *sample);
+                            let _ = tts.speak(&sample.to_string(), false);
+                        }
+                    });
+                    // If you want to use TTS for numbers, convert to string
+                    // let _ = tts.speak(&sample.to_string(), false);
+                }
+            }
+            std::process::exit(0);
+        });
+    }
+
     // Shared set for all tracked PIDs (parent + children)
-    const SHAKE_DURATION: u64 = 2000;
-
     let running = Arc::new(AtomicBool::new(true));
-
-    let mut grid: Option<(u32, u32, i32)> = None;
+    let grid_state_arc = Arc::new(Mutex::new(None::<GridState>));
+    let _ = GRID_STATE_ONCE.set(grid_state_arc.clone());
+    #[derive(Debug, Clone)]
+    struct GridConfig {
+        rows: u32,
+        cols: u32,
+        monitor: i32,
+    }
+    let mut grid: Option<GridConfig> = None;
     let mut follow_children = false;
     let mut follow_forver = false;
     let mut positional_args = Vec::new();
     let mut timeout_secs: Option<u64> = None;
     let mut hwnd_start_times: HashMap<HWND, Instant> = HashMap::new();
-    let mut should_flash_topmost = false;
+    let mut flash_topmost_ms: u64 = 10; // default to 10ms
     let mut should_hide_title_bar = false;
     let mut should_hide_border = false;
     let mut args = env::args_os().skip(1).peekable();
-    let mut shake_duration: u64 = 2000; // default 2000ms
+    let mut shake_duration: u64 = 500; // default 2000ms
     let mut fit_grid = false;
     let mut reserve_parent_cell = false;
     let mut assign_parent_cell: Option<(u32, u32, Option<i32>)> = None;
     let mut hide_taskbar = false;
     let mut show_taskbar = false;
     let mut debug_chrome = false;
+    let mut grid_placement_mode = GridPlacementMode::FirstFree; // default is FirstFree (use --grid-placement=sequential for sequential)
+    let mut retain_parent_focus = false;
+    let mut retain_launcher_focus = false;
+    let mut keep_open = false; // <-- Add this near your other flags
     while let Some(arg) = args.next() {
         let arg_str = arg.to_string_lossy();
         if arg_str == "-f" || arg_str == "--follow" {
@@ -493,7 +1367,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else if arg_str == "-F" || arg_str == "--follow-forver" {
             follow_children = true;
             follow_forver = true;
-        } else if arg_str == "-hT" || arg_str == "--hide-title-bar" {
+        } else if arg_str == "-ko" || arg_str == "--keep-open" {   // <-- Add this
+        keep_open = true;
+    } else if arg_str == "-hT" || arg_str == "--hide-title-bar" {
             should_hide_title_bar = true;
         } else if arg_str == "--show-taskbar" || arg_str == "-stb" {
             show_taskbar = true;
@@ -505,7 +1381,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .expect("Expected ROWSxCOLS or ROWSxCOLSmDISPLAY# after -g/--grid");
             let grid_str = grid_arg.to_string_lossy();
             let (rows, cols, monitor) = parse_grid_arg(&grid_str);
-            grid = Some((rows, cols, monitor));
+            grid = Some(GridConfig { rows, cols, monitor });
             println!("Grid set to {}x{} on monitor {}", rows, cols, monitor);
         } else if arg_str == "--hide-taskbar" || arg_str == "-htb" {
             hide_taskbar = true;
@@ -513,7 +1389,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Support -g2x2 or -g2x2m1
             let grid_str = &arg_str[2..];
             let (rows, cols, monitor) = parse_grid_arg(grid_str);
-            grid = Some((rows, cols, monitor));
+            grid = Some(GridConfig { rows, cols, monitor });
             println!("Grid set to {}x{} on monitor {}", rows, cols, monitor);
         } else if arg_str == "-t" || arg_str == "--timeout" {
             let t_arg = args
@@ -526,7 +1402,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .expect("Invalid timeout value"),
             );
         } else if arg_str == "-T" || arg_str == "--flash-topmost" {
-            should_flash_topmost = true;
+            // Accept an optional value (milliseconds)
+            if let Some(val) = args.peek() {
+                if let Ok(ms) = val.to_string_lossy().parse::<u64>() {
+                    args.next(); // consume
+                    flash_topmost_ms = ms;
+                } else {
+                    flash_topmost_ms = 10; // default
+                }
+            } else {
+                flash_topmost_ms = 10; // default
+            }
         } else if arg_str == "-hB" || arg_str == "--hide-border" {
             should_hide_border = true;
         } else if arg_str == "--shake-duration" || arg_str == "-sd" {
@@ -564,6 +1450,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 assign_parent_cell = Some((0, 0, None));
             }
+        } else if arg_str.starts_with("--grid-placement=") {
+            let mode = arg_str.split('=').nth(1).unwrap_or("firstfree");
+            grid_placement_mode = match mode.to_ascii_lowercase().as_str() {
+                "sequential" => GridPlacementMode::Sequential,
+                _ => GridPlacementMode::FirstFree,
+            };
+        } else if arg_str == "--retain-parent-focus" || arg_str == "-rpf" {
+            retain_parent_focus = true;
+        } else if arg_str == "--retain-launcher-focus" || arg_str == "-rlf" {
+            retain_launcher_focus = true;
         } else {
             positional_args.push(arg);
             // Push the rest as positional args
@@ -590,7 +1486,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut file = args
         .next()
         .expect("Usage: startt [-f] [-g ROWSxCOLS or ROWSxCOLSmDISPLAY#] <executable|document|URL> [args...]");
-    if let Some((_, _, monitor)) = grid {
+    if let Some(GridConfig { monitor, .. }) = grid {
         if hide_taskbar {
             println!("Hiding taskbar on monitor {}", monitor);
             hide_taskbar_on_monitor(monitor);
@@ -645,12 +1541,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         params = file_str.to_string();
     }
     // Convert both strings to wide (UTF-16) null-terminated
-    let file_w = U16CString::from_os_str(file.clone())?;
+    let file_w = U16CString::from_os_str(file.clone()).map_err(|e| windows::core::Error::new(windows::core::HRESULT(0), format!("{:?}", e)))?;
     let params_w = if params.is_empty() {
-        None
-    } else {
-        Some(U16CString::from_str(&params)?)
-    };
+            None
+        } else {
+            Some(U16CString::from_str(&params).map_err(|e| windows::core::Error::new(windows::core::HRESULT(0), format!("{:?}", e)))?)
+        };
 
     // Prepare to collect shake thread handles
     let mut shake_handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
@@ -675,8 +1571,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     unsafe {
         if winapi::um::shellapi::ShellExecuteExW(&mut sei) == 0 {
-            return Err(Box::new(std::io::Error::last_os_error()));
+            return Err(windows::core::Error::from(std::io::Error::last_os_error()));
         }
+
+        let mut active_windows: Vec<(HWND, u32, String, (i32, i32, i32, i32))> = Vec::new();
+        let mut staged_windows: VecDeque<(HWND, u32, String, (i32, i32, i32, i32))> = VecDeque::new();
         // Get the PID of the process that launched us
         let launching_pid = get_parent_pid(std::process::id()).unwrap_or(0);
         println!("Launching PID (parent of this process): {}", launching_pid);
@@ -699,13 +1598,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let tracked_pids_for_ctrlc = tracked_pids.clone();
             let parent_hwnd_for_ctrlc = parent_hwnd.clone();
             ctrlc::set_handler(move || {
-                let hwnd_opt = parent_hwnd_for_ctrlc.lock().unwrap();
+               let hwnd_opt = {
+                    let guard = parent_hwnd_for_ctrlc.lock().unwrap();
+                    *guard
+                };
                 println!(
                     "Ctrl+C reached for parent HWND {:?}, sending WM_CLOSE",
-                    *hwnd_opt
+                    hwnd_opt
                 );
                 unsafe {
-                    if let Some(hwnd_isize) = *hwnd_opt {
+                    if let Some(hwnd_isize) = hwnd_opt {
                         let hwnd = hwnd_isize as HWND;
                         // Send WM_CLOSE to the parent window
                         winapi::um::winuser::SendMessageW(
@@ -719,7 +1621,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 println!("\nCtrl+C pressed! Killing all child processes...");
                 running.store(false, Ordering::SeqCst);
-                let mut child_pids = get_child_pids(parent_pid);
+                let mut child_pids = startt::get_child_pids(parent_pid);
                 let etw_pids: Vec<u32> = tracked_pids_for_ctrlc
                     .lock()
                     .unwrap()
@@ -741,7 +1643,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         println!("Terminated PID {}", pid);
                     }
                 }
-            })?;
+                std::process::exit(0);
+            }).map_err(|e| windows::core::Error::new(windows::core::HRESULT(0), format!("{:?}", e)))?;
         }
 
         println!("Launched PID = {}", parent_pid);
@@ -835,31 +1738,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         // Create grid state if needed
-        let mut grid_state: Option<GridState> = grid.map(|(rows, cols, monitor)| {
-            println!("Creating grid_state with monitor: {}", monitor);
-            let monitor_rect = get_monitor_rect(monitor, hide_taskbar);
-            GridState {
-                rows,
-                cols,
-                monitor,
-                next_cell: 0,
-                monitor_rect,
-            }
-        });
-        if let Some(ref grid_state) = grid_state {
-            println!(
-                "Grid enabled: {}x{} on monitor {} (rect: left={}, top={}, right={}, bottom={})",
-                grid_state.rows,
-                grid_state.cols,
-                grid_state.monitor,
-                grid_state.monitor_rect.left,
-                grid_state.monitor_rect.top,
-                grid_state.monitor_rect.right,
-                grid_state.monitor_rect.bottom
-            );
-        }
+
+
+
+        
+        // let mut grid_state: Option<GridState> = None;
+       
         // --- Parent window(s) ---
-        // let mut shake_handles = Vec::new();
+        // Extract grid config early to avoid moving grid
+        let (grid_rows, grid_cols, grid_monitor) = if let Some(ref g) = grid {
+            (g.rows, g.cols, g.monitor)
+        } else {
+            (1, 1, 0)
+        };
+
         for (i, (hwnd, pid, class_name, bounds)) in gui.clone().into_iter().enumerate() {
             // class_name here is a String
             let is_console = class_name == "ConsoleWindowClass";
@@ -893,33 +1785,129 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("Hiding title bar for HWND {:?}", hwnd);
                     hide_window_title_bar(hwnd);
                 }
-                if i == 0 {
-                    // This is the parent window, assign to the specified cell if requested
-                    let (parent_row, parent_col, parent_monitor_opt) =
-                        assign_parent_cell.unwrap_or((0, 0, None));
-                    let parent_monitor = parent_monitor_opt
-                        .or_else(|| grid_state.as_ref().map(|g| g.monitor))
-                        .unwrap_or(0);
-                    println!(
-                        "Assigning parent: parent_monitor_opt={:?}, grid_state.monitor={}, using hide_taskbar={}",
-                        parent_monitor_opt,
-                        grid_state.as_ref().map(|g| g.monitor).unwrap_or(-1),
-                        hide_taskbar
-                    );
-                    // Only use full area if not a console window; consoles can't do that *shrug*
-                    let use_full_area = if is_console { false } else { hide_taskbar };
-                    let monitor_rect = get_monitor_rect(parent_monitor, use_full_area);
-                    let cell_w = (monitor_rect.right - monitor_rect.left)
-                        / grid_state.as_ref().unwrap().cols as i32;
-                    let cell_h = (monitor_rect.bottom - monitor_rect.top)
-                        / grid_state.as_ref().unwrap().rows as i32;
-                    let new_x = monitor_rect.left + parent_col as i32 * cell_w;
-                    let new_y = monitor_rect.top + parent_row as i32 * cell_h;
+        if i == 0 {
+            // Properly initialize grid_state if grid is enabled and grid_state is None
+            if grid.is_some() && grid_state_arc.lock().unwrap().is_none() {
+                let rows = grid_rows;
+                let cols = grid_cols;
+                let monitor = grid_monitor;
+                println!("Creating grid_state with monitor: {}", monitor);
+                let monitor_rect = get_monitor_rect(monitor, hide_taskbar);
+                let reserved_cell = if reserve_parent_cell {
+                    assign_parent_cell.map(|(r, c, _)| (r * cols + c) as usize)
+                } else {
+                    None
+                };
+                let mut g = GridState {
+                    rows,
+                    cols,
+                    monitor,
+                    next_cell: 0,
+                    monitor_rect,
+                    cells: vec![GridCell { hwnd: None, filled_at: None }; (rows * cols) as usize],
+                    reserved_cell,
+                    filled_count: 0,
+                    hwnd_to_cell: DashMap::new(),
+                    parent_cell_idx: None,
+                    parent_hwnd: *parent_hwnd.lock().unwrap().as_ref().unwrap_or(&0),
+                    launcher_pid: launching_pid,
+                    launcher_hwnd: find_hwnd_by_pid(launching_pid).map_or(0, |hwnd| hwnd as isize),
+                    retain_parent_focus,
+                    retain_launcher_focus,
+                    desktop_hwnd: unsafe { winapi::um::winuser::GetDesktopWindow() as isize },
+                    has_been_filled_at_some_point: false,
+                    fit_grid: fit_grid,
+                };
+                // Store the grid state in the global Arc<Mutex<Option<GridState>>>
+                *grid_state_arc.lock().unwrap() = Some(g);
+            
+                // Now you can safely call with/set_parent_cell
+                GridState::with(|g| {
+                    g.ensure_clean_desktop(); g.print_desktop_cells();
+                    g.set_parent_cell(reserved_cell, hwnd);
+                    // let result = g.assign_window_to_grid_cell(
+                    //     hwnd,
+                    //     fit_grid,
+                    //     grid_placement_mode,
+                    //     retain_parent_focus,
+                    //     retain_launcher_focus,
+                    //     timeout_secs,
+                    // );
+                    // match result {
+                    //     Some(cell_idx) => {
+                    //         println!("Assigned HWND {:?} to grid cell {}", hwnd, cell_idx);
+                    //     }
+                    //     None => {
+                    //         println!("Failed to assign HWND {:?} to grid", hwnd);
+                    //     }
+                    // }
+                });
+                install_window_destroy_hook(grid_state_arc.clone());
+                continue;
+
+                // grid_state = Some(g);
+            }
+            let rows = grid_rows;
+            let cols = grid_cols;
+            let monitor = grid_monitor;
+
+            if let Some(ref grid_state) = *grid_state_arc.lock().unwrap() {
+                println!(
+                    "Grid enabled: {}x{} on monitor {} (rect: left={}, top={}, right={}, bottom={})",
+                    rows,
+                    cols,
+                    monitor,
+                    grid_state.monitor_rect.left,
+                    grid_state.monitor_rect.top,
+                    grid_state.monitor_rect.right,
+                    grid_state.monitor_rect.bottom
+                );
+            }
+            // This is the parent window, assign to the specified cell if requested
+            let (parent_row, parent_col, parent_monitor_opt) =
+                assign_parent_cell.unwrap_or((0, 0, None));
+            let parent_monitor = parent_monitor_opt
+                .or_else(|| { Some(grid_monitor)})
+                .unwrap_or(0);
+            println!(
+                "Assigning parent: parent_monitor_opt={:?}, grid_state.monitor={}, using hide_taskbar={}",
+                parent_monitor_opt,
+                grid_monitor,
+                hide_taskbar
+            );
+
+
+            // Only use full area if not a console window; consoles can't do that *shrug*
+            let use_full_area = if is_console { false } else { hide_taskbar };
+            let monitor_rect = get_monitor_rect(parent_monitor, use_full_area);
+            // Minimize locking by only locking once and reusing the values
+            let (cols, rows) = (grid_cols, grid_rows);
+            let cell_w = (monitor_rect.right - monitor_rect.left) / cols as i32;
+            let cell_h = (monitor_rect.bottom - monitor_rect.top) / rows as i32;
+            let new_x = monitor_rect.left + parent_col as i32 * cell_w;
+            let new_y = monitor_rect.top + parent_row as i32 * cell_h;
+
+            // Only add to active_windows if grid is enabled and there is space
+            let grid_state = grid_state_arc.lock().unwrap();
+            let grid_slots = (rows as usize) * (cols as usize);
+
+            if grid_state.is_some() && active_windows.len() < grid_slots {
+                if let Some(ref mut grid_state) = grid_state_arc.lock().unwrap().as_mut() {
+                    // Compute reserved cell index and coordinates directly
+                    let parent_cell_idx = (parent_row * grid_state.cols + parent_col) as usize;
+                    let cell_w = (grid_state.monitor_rect.right - grid_state.monitor_rect.left)
+                        / grid_state.cols as i32;
+                    let cell_h = (grid_state.monitor_rect.bottom - grid_state.monitor_rect.top)
+                        / grid_state.rows as i32;
+                    let new_x = grid_state.monitor_rect.left + parent_col as i32 * cell_w;
+                    let new_y = grid_state.monitor_rect.top + parent_row as i32 * cell_h;
+
+                    //grid_state.hwnd_to_cell.insert(hwnd, parent_cell_idx);
+                    // Move/resize window as before
 
                     if is_console && fit_grid {
-                        // Try to move/resize, fallback if it fails
                         let mut test_h = cell_h;
-                        let min_h = 100; // Don't go below this height
+                        let min_h = 100;
                         let mut success = false;
                         while test_h >= min_h {
                             SetWindowPos(
@@ -931,31 +1919,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 test_h,
                                 SWP_NOZORDER,
                             );
-                            // Give Windows a moment to apply the move
                             sleep(Duration::from_millis(100));
                             let mut rect = std::mem::zeroed();
                             if winapi::um::winuser::GetWindowRect(hwnd, &mut rect) != 0 {
                                 let actual_x = rect.left;
                                 let actual_y = rect.top;
                                 let actual_h = rect.bottom - rect.top;
-                                if actual_x == new_x
-                                    && actual_y == new_y
-                                    && (actual_h - test_h).abs() < 8
-                                {
+                                if actual_x == new_x && actual_y == new_y && (actual_h - test_h).abs() < 8 {
                                     success = true;
-                                    println!(
-                                        "Console window moved and resized to height {}",
-                                        test_h
-                                    );
+                                    println!("Console window moved and resized to height {}", test_h);
                                     break;
                                 }
                             }
-                            test_h -= 40; // Try a bit smaller
+                            test_h -= 40;
                         }
                         if !success {
-                            println!(
-                                "Warning: Could not fit console window to grid cell, even after shrinking."
-                            );
+                            println!("Warning: Could not fit console window to grid cell, even after shrinking.");
                         }
                     } else {
                         SetWindowPos(
@@ -972,72 +1951,166 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             },
                         );
                     }
-                } else {
+
+                    grid_state.set_parent_cell(Some(parent_cell_idx), hwnd);
+                    // Mark the reserved cell as occupied
+                    grid_state.cells[parent_cell_idx] = GridCell {
+                        hwnd: Some(hwnd),
+                        filled_at: Some(Instant::now()),
+                    };
+                    println!("Reserved parent cell {} for HWND {:?}", parent_cell_idx, hwnd);
+                }
+                if reserve_parent_cell {
+                    if let Some(ref mut grid_state) = grid_state_arc.lock().unwrap().as_mut() {
+                        let (parent_row, parent_col, _) = assign_parent_cell.unwrap_or((0, 0, None));
+                        let parent_cell_idx = (parent_row * grid_state.cols + parent_col) as usize;
+                        grid_state.cells[parent_cell_idx] = GridCell {
+                            hwnd: Some(hwnd),
+                            filled_at: Some(Instant::now()),
+                        };
+                        println!("Reserved parent cell {} for HWND {:?}", parent_cell_idx, hwnd);
+                    }
+                }
+                active_windows.push((hwnd, pid, class_name.clone(), bounds));
+                hwnd_start_times.insert(hwnd, Instant::now());
+            } else {
+                // Stage the parent window if grid is full
+                println!("Staging parent HWND {:?} (PID: {}) for later grid placement", hwnd, pid);
+                staged_windows.push_back((hwnd, pid, class_name.clone(), bounds));
+                // Optionally, place behind frontmost window:
+                SetWindowPos(
+                    hwnd,
+                    winapi::um::winuser::HWND_BOTTOM,
+                    0, 0, 0, 0,
+                    winapi::um::winuser::SWP_NOMOVE | SWP_NOSIZE,
+                );
+            }
+
+            if keep_open {
+    let parent_hwnd_val = {
+        let phwnd = parent_hwnd.lock().unwrap();
+        *phwnd
+    };
+    if let Some(hwnd_isize) = parent_hwnd_val {
+        let hwnd = hwnd_isize as HWND;
+        let hwnd_val = hwnd as isize;
+        std::thread::spawn(move || {
+            use winapi::um::winuser::{GetMessageW, TranslateMessage, DispatchMessageW, MSG, WM_CLOSE};
+            let hwnd = hwnd_val as winapi::shared::windef::HWND;
+            let mut msg: MSG = unsafe { std::mem::zeroed() };
+            loop {
+                let ret = unsafe { GetMessageW(&mut msg, hwnd, 0, 0) };
+                if ret <= 0 {
+                    break;
+                }
+                if msg.message == WM_CLOSE {
+                    println!("Intercepted WM_CLOSE for parent window, --keep-open is set, ignoring.");
+                    continue; // Ignore the close message
+                }
+                unsafe {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+        });
+    }
+}
+        } else {
                     // Move to grid cell if grid is enabled
-                    if let Some(ref mut grid_state) = grid_state {
+                    if let Some(ref mut grid_state) = grid_state_arc.lock().unwrap().as_mut() {
                         // Now get the new window rect (frame may have changed)
                         let mut rect = std::mem::zeroed();
                         if winapi::um::winuser::GetWindowRect(hwnd, &mut rect) != 0 {
                             let win_width = rect.right - rect.left;
                             let win_height = rect.bottom - rect.top;
-                            let (mut new_x, mut new_y) =
-                                grid_state.next_position(win_width, win_height, fit_grid);
+                            let (cell_idx, mut new_x, mut new_y) =
+                                                            grid_state.next_position(win_width, win_height, fit_grid, grid_placement_mode);
 
-                            // Clamp as before
-                            let min_x = grid_state.monitor_rect.left;
-                            let min_y = grid_state.monitor_rect.top;
-                            let max_x = grid_state.monitor_rect.right
-                                - if fit_grid {
-                                    (grid_state.monitor_rect.right - grid_state.monitor_rect.left)
-                                        / grid_state.cols as i32
-                                } else {
-                                    win_width
-                                };
-                            let max_y = grid_state.monitor_rect.bottom
-                                - if fit_grid {
-                                    (grid_state.monitor_rect.bottom - grid_state.monitor_rect.top)
-                                        / grid_state.rows as i32
-                                } else {
-                                    win_height
-                                };
-                            new_x = new_x.clamp(min_x, max_x);
-                            new_y = new_y.clamp(min_y, max_y);
-
-                            if fit_grid && !is_console {
-                                let cell_w = (grid_state.monitor_rect.right
-                                    - grid_state.monitor_rect.left)
+                            // Before moving, check if the window is already at the correct position and size
+                            let mut needs_move = true;
+                            if winapi::um::winuser::GetWindowRect(hwnd, &mut rect) != 0 {
+                                let current_x = rect.left;
+                                let current_y = rect.top;
+                                let current_w = rect.right - rect.left;
+                                let current_h = rect.bottom - rect.top;
+                                let cell_w = (grid_state.monitor_rect.right - grid_state.monitor_rect.left)
                                     / grid_state.cols as i32;
-                                let cell_h = (grid_state.monitor_rect.bottom
-                                    - grid_state.monitor_rect.top)
+                                let cell_h = (grid_state.monitor_rect.bottom - grid_state.monitor_rect.top)
                                     / grid_state.rows as i32;
-                                println!(
-                                    "Resizing and moving HWND {:?} to grid cell: ({}, {}) size=({}, {})",
-                                    hwnd, new_x, new_y, cell_w, cell_h
-                                );
-                                SetWindowPos(
-                                    hwnd,
-                                    std::ptr::null_mut(),
-                                    new_x,
-                                    new_y,
-                                    cell_w,
-                                    cell_h,
-                                    SWP_NOZORDER,
-                                );
-                            } else {
-                                println!(
-                                    "Moving HWND {:?} to grid cell: ({}, {}) size=({}, {})",
-                                    hwnd, new_x, new_y, win_width, win_height
-                                );
-                                SetWindowPos(
-                                    hwnd,
-                                    std::ptr::null_mut(),
-                                    new_x,
-                                    new_y,
-                                    0,
-                                    0,
-                                    SWP_NOSIZE | SWP_NOZORDER,
-                                );
+                                if current_x == new_x && current_y == new_y && current_w == cell_w && current_h == cell_h {
+                                    needs_move = false;
+                                }
                             }
+                            if needs_move {
+                                // Clamp as before
+                                let min_x = grid_state.monitor_rect.left;
+                                let min_y = grid_state.monitor_rect.top;
+                                let max_x = grid_state.monitor_rect.right
+                                    - if fit_grid {
+                                        (grid_state.monitor_rect.right - grid_state.monitor_rect.left)
+                                            / grid_state.cols as i32
+                                    } else {
+                                        win_width
+                                    };
+                                let max_y = grid_state.monitor_rect.bottom
+                                    - if fit_grid {
+                                        (grid_state.monitor_rect.bottom - grid_state.monitor_rect.top)
+                                            / grid_state.rows as i32
+                                    } else {
+                                        win_height
+                                    };
+                                new_x = new_x.clamp(min_x, max_x);
+                                new_y = new_y.clamp(min_y, max_y);
+
+                                // Move/resize as before...
+                                if fit_grid && !is_console {
+                                    let cell_w = (grid_state.monitor_rect.right - grid_state.monitor_rect.left)
+                                        / grid_state.cols as i32;
+                                    let cell_h = (grid_state.monitor_rect.bottom - grid_state.monitor_rect.top)
+                                        / grid_state.rows as i32;
+                                    println!(
+                                        "Resizing and moving HWND {:?} to grid cell: ({}, {}) size=({}, {})",
+                                        hwnd, new_x, new_y, cell_w, cell_h
+                                    );
+                                    SetWindowPos(
+                                        hwnd,
+                                        std::ptr::null_mut(),
+                                        new_x,
+                                        new_y,
+                                        cell_w,
+                                        cell_h,
+                    SWP_NOZORDER,
+                                    );
+                                } else {
+                                    println!(
+                                        "Moving child HWND {:?} to grid cell: ({}, {}) size=({}, {})",
+                                        hwnd, new_x, new_y, win_width, win_height
+                                    );
+                                    SetWindowPos(
+                                        hwnd,
+                                        std::ptr::null_mut(),
+                                        new_x,
+                                        new_y,
+                                        0,
+                                        0,
+                    SWP_NOSIZE | SWP_NOZORDER,
+                                    );
+                                }
+                                // After moving, verify the window is at the expected position
+                                let mut success = false;
+                                if winapi::um::winuser::GetWindowRect(hwnd, &mut rect) != 0 {
+                                    let actual_x = rect.left;
+                                    let actual_y = rect.top;
+                                    if actual_x == new_x && actual_y == new_y {
+                                        success = true;
+                                    }
+                                }
+                                if !success {
+                                    println!("Warning: Could not fit console window to grid cell, even after moving.");
+                                }
+                            }
+                        } else {
+                            println!("Warning: Could not get window rect for HWND {:?}", hwnd);
                         }
                     }
                 }
@@ -1054,11 +2127,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("Hiding title bar for HWND {:?}", hwnd);
                     hide_window_title_bar(hwnd);
                 }
-                if should_flash_topmost {
-                    println!("Flashing HWND {:?} as topmost for 1 second...", hwnd);
-                    flash_topmost(hwnd, 1000);
+                if flash_topmost_ms > 0 {
+                    println!("Flashing HWND {:?} as topmost for {} ms...", hwnd, flash_topmost_ms);
+                    flash_topmost(hwnd, flash_topmost_ms);
                 }
-                println!("Shaking window: {:?}", hwnd);
                 // Shake the window in a non-blocking way (spawn a thread)
                 let hwnd_copy = hwnd as isize;
                 // Spawn the shake thread and collect the JoinHandle
@@ -1092,10 +2164,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("Hiding title bar for HWND {:?}", hwnd);
                     hide_window_title_bar(hwnd);
                 }
-                if should_flash_topmost {
-                    println!("Flashing HWND {:?} as topmost for 1 second...", hwnd);
-                    flash_topmost(hwnd, 1000);
-                }
+if flash_topmost_ms > 0 {
+    println!("Flashing HWND {:?} as topmost for {} ms...", hwnd, flash_topmost_ms);
+    flash_topmost(hwnd, flash_topmost_ms);
+}
                 // Shake the window in a non-blocking way (spawn a thread)
                 let hwnd_copy = hwnd as isize;
                 let shake_handle = std::thread::spawn(move || {
@@ -1114,10 +2186,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Track which child HWNDs we've already shaken to avoid repeats
-        let mut shaken_hwnds = HashSet::new();
+        let shaken_hwnds = Arc::new(Mutex::new(HashSet::<HWND>::new()));
         // Track HWNDs that failed to shake (e.g., GetWindowRect failed)
-        let mut failed_hwnds = HashSet::new();
+        let mut failed_hwnds: HashMap<isize, u32> = HashMap::new();
+        const MAX_HWND_RETRIES: u32 = 3;
         let mut failed_pids: HashSet<u32> = HashSet::new();
+        let mut last_child_pids: Vec<u32> = Vec::new();
+        let mut last_occupancy: Option<Vec<Option<HWND>>> = None;
 
         // --- Child windows in follow_children loop ---
         while follow_children && running.load(Ordering::SeqCst) {
@@ -1138,17 +2213,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // let child_pids = get_child_pids(parent_pid);
             // println!("Child PIDs: {:?}", child_pids);
-            let mut child_pids = get_child_pids(parent_pid);
-            let etw_pids: Vec<u32> = tracked_pids.lock().unwrap().iter().copied().collect();
-            for pid in etw_pids {
-                if !child_pids.contains(&pid) {
-                    child_pids.push(pid);
-                }
+
+
+            // Use a HashSet to avoid duplicates and for faster lookup
+            let mut child_pids: HashSet<u32> = startt::get_child_pids(parent_pid).into_iter().collect();
+            let etw_pids = tracked_pids.lock().unwrap();
+            child_pids.extend(etw_pids.iter().copied());
+
+            // Only print if changed
+            let mut child_pids_vec: Vec<u32> = child_pids.iter().copied().collect();
+            child_pids_vec.sort_unstable();
+            if child_pids_vec != last_child_pids {
+                println!("Child PIDs (snapshot + ETW): {:?}", child_pids_vec);
+                last_child_pids = child_pids_vec.clone();
             }
-            println!("Child PIDs (snapshot + ETW): {:?}", child_pids);
 
             if !follow_forver {
-                // Check if any tracked process is still running
+                // Check if any tracked process is still running OR parent HWND is still valid
                 let mut any_alive = false;
                 let mut all_pids = vec![parent_pid];
                 all_pids.extend(child_pids.iter().copied());
@@ -1163,76 +2244,130 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
-                if !any_alive {
-                    println!("All tracked processes have terminated. Exiting.");
-                    break;
+                // Also check if the parent HWND is still valid
+                let parent_hwnd_val = {
+                    let phwnd = parent_hwnd.lock().unwrap();
+                    *phwnd
+                };
+                let parent_hwnd_alive = if let Some(hwnd_isize) = parent_hwnd_val {
+                    let hwnd = hwnd_isize as HWND;
+                    unsafe { winapi::um::winuser::IsWindow(hwnd) != 0 }
+                } else {
+                    false
+                };
+                println!(
+                    "[DEBUG] any_alive: {}, parent_hwnd_alive: {}, !any_alive && !parent_hwnd_alive: {}",
+                    any_alive, parent_hwnd_alive, !any_alive && !parent_hwnd_alive
+                );
+                if !any_alive && !parent_hwnd_alive {
+                    println!("All tracked processes and parent window have terminated. Exiting.");
+                    std::process::exit(0);
                 }
             }
-
-            let mut _new_hwnds: Vec<HWND> = Vec::new();
-            #[allow(unused_assignments)]
-            let mut hwnd_pid_map = Vec::new(); // Track (HWND, PID) pairs
+println!("Enumerating child windows for PIDs: {:?}", child_pids);
+            // Use grid_state's DashMap to track HWNDs and their cell indices
+            let mut hwnd_pid_map: Vec<(HWND, u32)> = Vec::new();
             extern "system" fn enum_windows_proc(hwnd: HWND, lparam: isize) -> i32 {
-                let (child_pids, hwnds, hwnd_pid_map): &mut (
-                    &Vec<u32>,
-                    Vec<HWND>,
-                    Vec<(HWND, u32)>,
-                ) = unsafe { &mut *(lparam as *mut (&Vec<u32>, Vec<HWND>, Vec<(HWND, u32)>)) };
+                let (child_pids_ptr, hwnd_pid_map_ptr) = unsafe { &mut *(lparam as *mut (&HashSet<u32>, &mut Vec<(HWND, u32)>)) };
                 let mut process_id = 0;
                 unsafe { GetWindowThreadProcessId(hwnd, &mut process_id) };
-                if child_pids.contains(&process_id) {
-                    hwnds.push(hwnd);
-                    hwnd_pid_map.push((hwnd, process_id));
+                if child_pids_ptr.contains(&process_id) {
+                    hwnd_pid_map_ptr.push((hwnd, process_id));
                 }
                 1
             }
-            let hwnds = Vec::new();
-            let hwnd_pid_map_inner = Vec::new();
-            let mut data = (&child_pids, hwnds, hwnd_pid_map_inner);
-            EnumWindows(Some(enum_windows_proc), &mut data as *mut _ as isize);
-            _new_hwnds = data.1;
-            hwnd_pid_map = data.2;
+            let mut hwnd_pid_map_inner = Vec::new();
+            let mut data = (&child_pids, &mut hwnd_pid_map_inner);
+            unsafe {
+                EnumWindows(Some(enum_windows_proc), &mut data as *mut _ as isize);
+            }
+            hwnd_pid_map = hwnd_pid_map_inner;
 
-            for (hwnd, pid) in hwnd_pid_map {
-                if shaken_hwnds.contains(&hwnd) {
-                    // timeout hwnd_start_times:
+            println!("hwnd_pid_map: {:?}", hwnd_pid_map);
+
+            GridState::with_grid_state(|g| g.print_desktop_cells());
+
+            // for (hwnd, pid) in &hwnd_pid_map {
+            //     let mut class_name = [0u16; 256];
+            //     let class_name_len = winapi::um::winuser::GetClassNameW(
+            //                         *hwnd,
+            //                         class_name.as_mut_ptr(),
+            //                         class_name.len() as i32,
+            //                     );
+            //     let class_name_str = if class_name_len > 0 {
+            //         OsString::from_wide(&class_name[..class_name_len as usize])
+            //             .to_string_lossy()
+            //             .to_string()
+            //     } else {
+            //         String::from("<unknown>")
+            //     };
+            //     let parent = unsafe { winapi::um::winuser::GetParent(*hwnd) };
+            //     println!("Enumerated HWND {:?} (PID: {}) class: {} parent: {:?}", hwnd, pid, class_name_str, parent);
+            // }
+
+            for (hwnd, pid) in hwnd_pid_map.clone() {
+                let mut title = [0u16; 256];
+                let title_len = unsafe {
+                    winapi::um::winuser::GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32)
+                };
+                let title_str = if title_len > 0 {
+                    OsString::from_wide(&title[..title_len as usize])
+                        .to_string_lossy()
+                        .to_string()
+                } else {
+                    String::from("<no title>")
+                };
+                let msg = format!("PID {} HWND {:?} title: {}", pid, hwnd, title_str);
+
+
+                    // timeout hwnd_start_times
+                    // Only perform eviction if all non-reserved cells are occupied (no None in occupancy)
                     if let Some(timeout) = timeout_secs {
                         let now = Instant::now();
-                        let mut to_quit = Vec::new();
-                        for (&hwnd, &start) in hwnd_start_times.iter() {
-                            if now.duration_since(start).as_secs() >= timeout {
-                                to_quit.push(hwnd);
-                            }
+                        let program_start = *PROGRAM_START;
+
+                        if now.duration_since(program_start).as_secs() < timeout {
+                            // Not alive long enough, skip eviction
+                            continue;
                         }
-                        for hwnd in to_quit {
-                            println!("Timeout reached for HWND {:?}, sending WM_CLOSE", hwnd);
-                            unsafe {
-                                winapi::um::winuser::PostMessageW(
-                                    hwnd,
-                                    winapi::um::winuser::WM_CLOSE,
-                                    0,
-                                    0,
-                                );
+
+                        if let Some(ref mut grid_state) = grid_state_arc.lock().unwrap().as_mut() {
+                            let occupancy: Vec<Option<HWND>> = grid_state.cells.iter().map(|c| c.hwnd).collect();
+                            if last_occupancy.as_ref() != Some(&occupancy) {
+                                println!("Grid cell occupancy: {:?}", occupancy);
+                                last_occupancy = Some(occupancy);
                             }
-                            hwnd_start_times.remove(&hwnd);
+                            if unsafe { winapi::um::winuser::IsWindow(hwnd) } == 0 || unsafe { winapi::um::winuser::IsWindowVisible(hwnd) } == 0 {
+                                continue;
+                            }
+                            if grid_state.has_been_filled_at_some_point() {
+                                for (idx, cell) in grid_state.cells.iter_mut().enumerate() {
+                                    if let (Some(hwnd), Some(filled_at)) = (cell.hwnd, cell.filled_at) {
+                                        let elapsed = now.duration_since(filled_at).as_secs();
+                                        if elapsed >= timeout {
+                                            // Don't close the reserved/parent cell
+                                            if Some(idx) == grid_state.reserved_cell {
+                                                continue;
+                                            }
+                                            println!("Evicting HWND {:?} from cell {} due to timeout (periodic check)", hwnd, idx);
+                                            unsafe {
+                                                winapi::um::winuser::PostMessageW(
+                                                    hwnd,
+                                                    winapi::um::winuser::WM_CLOSE,
+                                                    0,
+                                                    0,
+                                                );
+                                            }
+                                            *cell = GridCell { hwnd: None, filled_at: None };
+                                            break; // one at a time.
+                                        }
+                                    }
+                                }
+                            } else {
+                                 println!("Eviction skipped: open cells exist in grid. {} of {}", grid_state.filled_count, grid_state.cells.len());
+                            }
                         }
                     }
-                    continue;
-                }
-
-                if failed_hwnds.contains(&hwnd) || failed_pids.contains(&pid) {
-                    continue;
-                }
-                let mut rect = std::mem::zeroed();
-                if winapi::um::winuser::GetWindowRect(hwnd, &mut rect) == 0 {
-                    eprintln!(
-                        "Failed to get window rect for HWND {:?} (PID: {})",
-                        hwnd, pid
-                    );
-                    failed_hwnds.insert(hwnd);
-                    failed_pids.insert(pid); // Mark this PID as failed
-                    continue;
-                }
                 // Print HWND info: class name and window type (top-level/child)
                 let mut class_name = [0u16; 256];
                 let class_name_len = winapi::um::winuser::GetClassNameW(
@@ -1247,17 +2382,61 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     String::from("<unknown>")
                 };
+                                let mut title = [0u16; 256];
+                let title_len = unsafe {
+                    winapi::um::winuser::GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32)
+                };
+                let title_str = if title_len > 0 {
+                    OsString::from_wide(&title[..title_len as usize])
+                        .to_string_lossy()
+                        .to_string()
+                } else {
+                    String::from("<no title>")
+                };
+
                 let is_console = class_name_str == "ConsoleWindowClass";
                 // Skip windows with class name "NVOpenGLPbuffer" or starting with "wgpu Device Class"
                 if class_name_str == "NVOpenGLPbuffer"
                     || class_name_str.starts_with("wgpu Device Class")
+                    || class_name_str.eq_ignore_ascii_case("MSCTFIME UI")
+                    || class_name_str.eq_ignore_ascii_case("Default IME")
+                    || class_name_str.starts_with("temp_d3d_window_")
+                    || class_name_str == "Winit Thread Event Target"
                 {
-                    println!(
-                        "Skipping HWND {:?} (PID: {}) due to class name: {}",
-                        hwnd, pid, class_name_str
-                    );
+                    // println!(
+                    //     "Skipping HWND {:?} (PID: {}) due to class name: {}",
+                    //     hwnd, pid, class_name_str
+                    // );
                     continue;
                 }
+                if unsafe { winapi::um::winuser::IsWindow(hwnd) } == 0 {
+                    continue;
+                }
+                if unsafe { winapi::um::winuser::IsWindowVisible(hwnd) } == 0 {
+                    continue;
+                }
+                if unsafe { winapi::um::winuser::GetParent(hwnd) } != std::ptr::null_mut() {
+                    continue;
+                }
+
+                    if let Some(fail_count) = failed_hwnds.get(&(hwnd as isize)) {
+                        if *fail_count >= MAX_HWND_RETRIES {
+                            println!(
+                                "Skipping HWND {:?} (PID: {}) because it failed {} times (max retries reached) {}",
+                                hwnd, pid, fail_count, title_str
+                            );
+                            continue;
+                        } else {
+                            println!(
+                                "Retrying HWND {:?} (PID: {}) - attempt {}/{}",
+                                hwnd, pid, fail_count + 1, MAX_HWND_RETRIES
+                            );
+                        }
+                    }
+                    if failed_pids.contains(&pid) {
+                        continue;
+                    }
+
                 let this_parent_hwnd = winapi::um::winuser::GetParent(hwnd);
                 if let Ok(phwnd_guard) = parent_hwnd.lock() {
                     if let Some(parent_hwnd_isize) = *phwnd_guard {
@@ -1267,99 +2446,234 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             continue;
                         }
                     }
-                }
+                } 
                 let window_type = if this_parent_hwnd.is_null() {
                     "Top-level"
                 } else {
-                    println!(
-                        "Skipping child HWND {:?} (PID: {}) with parent HWND {:?}",
-                        hwnd, pid, this_parent_hwnd
-                    );
+                    // println!(
+                    //     "Skipping child HWND {:?} (PID: {}) with parent HWND {:?}",
+                    //     hwnd, pid, this_parent_hwnd
+                    // );
                     continue;
                 };
-                println!(
-                    "Shaking child HWND {:?} (PID: {}) at rect: left={}, top={}, right={}, bottom={} | Class: {} | Type: {}",
-                    hwnd,
-                    pid,
-                    rect.left,
-                    rect.top,
-                    rect.right,
-                    rect.bottom,
-                    class_name_str,
-                    window_type
-                );
+
+                // let mut rect = std::mem::zeroed();
+                // if winapi::um::winuser::GetWindowRect(hwnd, &mut rect) == 0 {
+                //     if !failed_hwnds.contains_key(&(hwnd as isize)) {
+                //         eprintln!(
+                //             "Failed to get window rect for HWND {:?} (PID: {})",
+                //             hwnd, pid
+                //         );
+                //         // --- PATCH START: Evict from grid if present ---
+                //         if let Some(ref mut grid_state) = grid_state_arc.lock().unwrap().as_mut() {
+                //             if let Some(idx) = grid_state.hwnd_to_cell.remove(&hwnd).map(|(_, idx)| idx) {
+                //                     println!("Evicted HWND {:?} from grid cell {}", hwnd, idx);
+                //                 grid_state.cells[idx] = GridCell { hwnd: None, filled_at: None };
+                //             }
+                //         }
+                //         // --- PATCH END ---
+                //     }
+                //     *failed_hwnds.entry(hwnd as isize).or_insert(0) += 1;
+                //     continue;
+                // }
+
+                // println!(
+                //     "Shaking child HWND {:?} (PID: {}) at rect: left={}, top={}, right={}, bottom={} | Class: {} | Type: {}",
+                //     hwnd,
+                //     pid,
+                //     rect.left,
+                //     rect.top,
+                //     rect.right,
+                //     rect.bottom,
+                //     class_name_str,
+                //     window_type
+                // );
                 // Only now do we move to a grid cell and shake
-                if let Some(ref mut grid_state) = grid_state {
-                    let win_width = rect.right - rect.left;
-                    let win_height = rect.bottom - rect.top;
-                    // Get the next grid cell position and also the cell index (row, col)
-                    let total_cells = (grid_state.rows * grid_state.cols) as usize;
-                    let cell = grid_state.next_cell % total_cells;
-                    let row = cell / grid_state.cols as usize;
-                    let col = cell % grid_state.cols as usize;
-
-                    // If reserve_parent_cell is set, skip this cell and move to the next one
-                    let (reserved_row, reserved_col) =
-                        assign_parent_cell.map(|(r, c, _)| (r, c)).unwrap_or((0, 0));
-                    let (new_x, new_y, cell_w, cell_h) = if reserve_parent_cell {
-                        if row as u32 == reserved_row && col as u32 == reserved_col {
-                            // Skip this cell, increment next_cell and get the next position
-                            grid_state.next_cell += 1;
-                            let cell = grid_state.next_cell % total_cells;
-                            let row2 = cell / grid_state.cols as usize;
-                            let col2 = cell % grid_state.cols as usize;
-                            let (nx, ny) =
-                                grid_state.next_position(win_width, win_height, fit_grid);
-                            // Optionally, print debug info
-                            println!(
-                                "Skipping reserved parent cell ({}, {}), moving to cell ({}, {})",
-                                reserved_row, reserved_col, row2, col2
-                            );
-                            (nx, ny, row2, col2)
-                        } else {
-                            let (nx, ny) =
-                                grid_state.next_position(win_width, win_height, fit_grid);
-                            (nx, ny, row, col)
+                GridState::with_grid_state(|g| {
+                    let result = g.assign_window_to_grid_cell(
+                        hwnd,
+                        fit_grid,
+                        grid_placement_mode,
+                        retain_parent_focus,
+                        retain_launcher_focus,
+                        timeout_secs,
+                    );
+                    match result {
+                        Some(cell_idx) => {
+                            println!("Assigned HWND {:?} to grid cell {}", hwnd, cell_idx);
                         }
-                    } else {
-                        let (nx, ny) = grid_state.next_position(win_width, win_height, fit_grid);
-                        (nx, ny, row, col)
-                    };
-
-                    if fit_grid && !is_console {
-                        let cell_w = (grid_state.monitor_rect.right - grid_state.monitor_rect.left)
-                            / grid_state.cols as i32;
-                        let cell_h = (grid_state.monitor_rect.bottom - grid_state.monitor_rect.top)
-                            / grid_state.rows as i32;
-                        println!(
-                            "Resizing and moving HWND {:?} to grid cell: ({}, {}) size=({}, {})",
-                            hwnd, new_x, new_y, cell_w, cell_h
-                        );
-                        SetWindowPos(
-                            hwnd,
-                            std::ptr::null_mut(),
-                            new_x,
-                            new_y,
-                            cell_w,
-                            cell_h,
-                            SWP_NOZORDER,
-                        );
-                    } else {
-                        println!(
-                            "Moving child HWND {:?} to grid cell: ({}, {}) size=({}, {})",
-                            hwnd, new_x, new_y, win_width, win_height
-                        );
-                        SetWindowPos(
-                            hwnd,
-                            std::ptr::null_mut(),
-                            new_x,
-                            new_y,
-                            0,
-                            0,
-                            SWP_NOSIZE | SWP_NOZORDER,
-                        );
+                        None => {
+                            println!("Failed to assign HWND {:?} to grid", hwnd);
+                        }
                     }
-                }
+                });
+                continue;
+
+                // if let Some(ref mut grid_state) = grid_state_arc.lock().unwrap().as_mut() {
+
+
+
+
+
+//                     // let win_width = rect.right - rect.left;
+//                     // let win_height = rect.bottom - rect.top;
+
+//                     // Find the first available cell (empty or timed out)
+//                     // Avoid borrowing grid_state mutably inside the closure
+//                     let cell_indices: Vec<usize> = (0..grid_state.cells.len()).collect();
+//                                        let mut found_idx = None;
+//                     for idx in cell_indices {
+//                         if grid_state.is_cell_available(idx, timeout_secs) && Some(idx) != grid_state.reserved_cell {
+//                             found_idx = Some(idx);
+//                             break;
+//                         }
+//                     }
+
+//                     // --- PATCH START: Use next_position only once and use its result for both cell index and coordinates ---
+//                     let (cell_idx, new_x, new_y) = if let Some(idx) = found_idx {
+//                         // Use the found available cell and compute its coordinates
+//                         let row = idx / grid_state.cols as usize;
+//                         let col = idx % grid_state.cols as usize;
+//                         let cell_w = (grid_state.monitor_rect.right - grid_state.monitor_rect.left) / grid_state.cols as i32;
+//                         let cell_h = (grid_state.monitor_rect.bottom - grid_state.monitor_rect.top) / grid_state.rows as i32;
+//                         let x = grid_state.monitor_rect.left + col as i32 * cell_w;
+//                         let y = grid_state.monitor_rect.top + row as i32 * cell_h;
+//                         if fit_grid {
+//                             (idx, x, y)
+//                         } else {
+//                             let mut cx = x + (cell_w - win_width) / 2;
+//                             let mut cy = y + (cell_h - win_height) / 2;
+//                             let min_x = grid_state.monitor_rect.left;
+//                             let min_y = grid_state.monitor_rect.top;
+//                             let max_x = grid_state.monitor_rect.right - win_width;
+//                             let max_y = grid_state.monitor_rect.bottom - win_height;
+//                             cx = cx.clamp(min_x, max_x);
+//                             cy = cy.clamp(min_y, max_y);
+//                             (idx, cx, cy)
+//                         }
+//                     } else {
+//                         // Fallback: use next_position as before (may evict/overlay if all cells are busy)
+//                         let (fallback_idx, fallback_x, fallback_y) = grid_state.next_position(
+//                             win_width,
+//                             win_height,
+//                             fit_grid,
+//                             placement_mode,
+//                         );
+//                         eprintln!("Warning: All grid cells are busy, using fallback cell {}", fallback_idx);
+//                         grid_state.check_and_fix_grid_sync();
+//                         (fallback_idx, fallback_x, fallback_y)
+//                     };
+//                     // --- PATCH END ---
+
+//                     // --- PATCH START: Only assign to the cell if it is empty ---
+//                     if grid_state.cells[cell_idx].hwnd.is_none() {
+//                         grid_state.cells[cell_idx] = GridCell {
+//                             hwnd: Some(hwnd),
+//                             filled_at: Some(Instant::now()),
+//                         };
+//                         // Start eviction timer if needed
+//                         if grid_state.has_been_filled_at_some_point() {
+//                             if let Some(timeout) = timeout_secs {
+//                                 grid_state.cells[cell_idx].start_eviction_timer(cell_idx, timeout);
+//                             }
+//                         } else {
+//                             println!("Cell {} was occupied after move, skipping assignment.", cell_idx);
+//                                     }
+//                     }
+//                     // --- PATCH END ---
+
+//                     // Clamp as before
+//                     let min_x = grid_state.monitor_rect.left;
+//                     let min_y = grid_state.monitor_rect.top;
+//                     let max_x = grid_state.monitor_rect.right
+//                         - if fit_grid {
+//                             (grid_state.monitor_rect.right - grid_state.monitor_rect.left)
+//                                 / grid_state.cols as i32
+//                         } else {
+//                             win_width
+//                         };
+//                     let max_y = grid_state.monitor_rect.bottom
+//                         - if fit_grid {
+//                             (grid_state.monitor_rect.bottom - grid_state.monitor_rect.top)
+//                                 / grid_state.rows as i32
+//                         } else {
+//                             win_height
+//                         };
+//                     let new_x = new_x.clamp(min_x, max_x);
+//                     let new_y = new_y.clamp(min_y, max_y);
+
+//                     // Move/resize as before...
+//                     if fit_grid && !is_console {
+//                         let cell_w = (grid_state.monitor_rect.right - grid_state.monitor_rect.left)
+//                             / grid_state.cols as i32;
+//                         let cell_h = (grid_state.monitor_rect.bottom - grid_state.monitor_rect.top)
+//                             / grid_state.rows as i32;
+//                         println!(
+//                             "Resizing and moving HWND {:?} to grid cell: ({}, {}) size=({}, {})",
+//                             hwnd, new_x, new_y, cell_w, cell_h
+//                         );
+//                         SetWindowPos(
+//                             hwnd,
+//                             std::ptr::null_mut(),
+//                             new_x,
+//                             new_y,
+//                             cell_w,
+//                             cell_h,
+//                             SWP_NOZORDER,
+//                         );
+//                     } else {
+//                         println!(
+//                             "Moving child HWND {:?} to grid cell: ({}, {}) size=({}, {})",
+//                             hwnd, new_x, new_y, win_width, win_height
+//                         );
+//                         SetWindowPos(
+//                             hwnd,
+//                             std::ptr::null_mut(),
+//                             new_x,
+//                             new_y,
+//                             0,
+//                             0,
+//                             SWP_NOSIZE | SWP_NOZORDER,
+//                         );
+//                     }
+//                     // After moving and verifying the window:
+//                     let mut rect = std::mem::zeroed();
+//                     if winapi::um::winuser::GetWindowRect(hwnd, &mut rect) != 0 {
+//                         let actual_x = rect.left;
+//                         let actual_y = rect.top;
+//                         // Only assign after move/verify!
+// if actual_x == new_x && actual_y == new_y {
+//     if grid_state.cells[cell_idx].hwnd.is_none() {
+//         grid_state.cells[cell_idx] = GridCell {
+//             hwnd: Some(hwnd),
+//             filled_at: Some(Instant::now()),
+//         };
+//         // Start eviction timer if needed
+//         if grid_state.has_been_filled_at_some_point() {
+//             if let Some(timeout) = timeout_secs {
+//                 grid_state.cells[cell_idx].start_eviction_timer(cell_idx, timeout);
+//             }
+//         }
+//     // } else {
+//     //     println!("Cell {} was occupied after move, skipping assignment.", cell_idx);
+//     // }
+// } else {
+//     println!(
+//         "Warning: HWND {:?} did not move to expected position (wanted: {},{} got: {},{})",
+//         hwnd, new_x, new_y, actual_x, actual_y
+//     );
+//     // Optionally: try the previous cell again by not incrementing filled_count
+//     // (You may want to retry the assignment here)
+// }
+                //     } else {
+                //         println!(
+                //             "Warning: Could not verify position for HWND {:?}",
+                //             hwnd
+                //         );
+                //         // Optionally: try the previous cell again by not incrementing filled_count
+                //     }
+                // }
+
                 if should_hide_border {
                     println!("Hiding border for HWND {:?}", hwnd);
                     hide_window_border(hwnd);
@@ -1369,49 +2683,242 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     hide_window_title_bar(hwnd);
                 }
 
-                if should_flash_topmost {
-                    println!("Flashing HWND {:?} as topmost for 1 second...", hwnd);
-                    flash_topmost(hwnd, 1000);
-                }
+if flash_topmost_ms > 0 {
+    println!("Flashing HWND {:?} as topmost for {} ms...", hwnd, flash_topmost_ms);
+    flash_topmost(hwnd, flash_topmost_ms);
+}
+
+       if shaken_hwnds.lock().unwrap().contains(&hwnd) {
+                        println!("Skipping HWND {:?} (PID: {}) because it was already shaken {} ", hwnd, pid,title_str);
+                        if let Some(ref gs) = *grid_state_arc.lock().unwrap() {
+                            let occupancy: Vec<Option<HWND>> = gs.cells.iter().map(|c| c.hwnd).collect();
+                            println!("Grid cell occupancy: {:?}", occupancy);
+                        }
+                        if title_str == "<no title>" {
+                            println!("HWND {:?} (PID: {}) has no title, sending WM_CLOSE", hwnd, pid);
+                            unsafe {
+                                winapi::um::winuser::PostMessageW(
+                                    hwnd,
+                                    winapi::um::winuser::WM_CLOSE,
+                                    0,
+                                    0,
+                                );
+                            }
+                            continue;
+                        }
+                        if unsafe { winapi::um::winuser::IsWindow(hwnd) } == 0 {
+                            println!("HWND {:?} (PID: {}) is no longer valid, removing from shaken_hwnds", hwnd, pid);
+                            shaken_hwnds.lock().unwrap().remove(&hwnd);
+                            continue;
+                        }
+                        continue;
+                    }
                 // Shake the window in a non-blocking way (spawn a thread)
+                // let hwnd_copy = hwnd as isize;
+                // std::thread::spawn(move || {
+                //     let hwnd = hwnd_copy as HWND;
+                //     shake_window(hwnd, 10, shake_duration);
+                // });
+                let shaken_hwnds = {
+                    let set = shaken_hwnds.lock().unwrap();
+                    Arc::new(Mutex::new(set.iter().map(|h| *h as isize).collect::<HashSet<isize>>()))
+                };
                 let hwnd_copy = hwnd as isize;
+                let shaken_hwnds_clone = Arc::clone(&shaken_hwnds);
                 std::thread::spawn(move || {
                     let hwnd = hwnd_copy as HWND;
                     shake_window(hwnd, 10, shake_duration);
+                    let mut set = shaken_hwnds_clone.lock().unwrap();
+                    set.insert(hwnd_copy);
                 });
-                shaken_hwnds.insert(hwnd);
+                // No need to reassign shaken_hwnds; just use the Arc<Mutex<...>> as is.
                 if !hwnd_start_times.contains_key(&hwnd) {
                     hwnd_start_times.insert(hwnd, Instant::now());
                 }
             }
+          std::thread::sleep(std::time::Duration::from_millis(2000)); 
 
-            sleep(Duration::from_millis(2000));
+            }
+
+            // // When a window closes, free its cell:
+            // active_windows.retain(|(hwnd, pid, _, _)| {
+            //     let handle = OpenProcess(winapi::um::winnt::SYNCHRONIZE, 0, *pid);
+            //     let still_running = if !handle.is_null() {
+            //         let wait_result = unsafe { winapi::um::synchapi::WaitForSingleObject(handle, 0) };
+            //         CloseHandle(handle);
+            //         wait_result != winapi::um::winbase::WAIT_OBJECT_0
+            //     } else {
+            //         false };
+            //     if !still_running {
+            //         if let Some(ref mut grid_state) = grid_state {
+
+            //             if let Some(hwnd) = grid_state.cells[idx].hwnd.take() {
+            //                 grid_state.hwnd_to_cell.remove(&hwnd);
+            //             }
+            //             grid_state.cells[idx].hwnd = None;
+            //             grid_state.cells[idx].filled_at = None;
+
+            //         }
+            //         println!("Grid window HWND {:?} (PID: {}) closed, freeing slot", hwnd, pid);
+            //     }
+            //     still_running
+            // });
+
+            // --- Promotion logic: when a grid window closes, promote staged window ---
+            // Remove closed windows from active_windows and promote staged windows
+            let mut grid_state = grid_state_arc.lock().unwrap();
+            let grid_slots = {
+                let grid_state = grid_state_arc.lock().unwrap();
+                grid_state.as_ref().unwrap().rows * grid_state.as_ref().unwrap().cols
+            } as usize;
+            while active_windows.len() >= grid_slots && !staged_windows.is_empty() {
+                // Only lock when you need to access grid_state
+                let (parent_hwnd_val, reserved_cell) = {
+                    let grid_state = grid_state_arc.lock().unwrap();
+                    let parent_hwnd_val = {
+                        let phwnd = parent_hwnd.lock().unwrap();
+                        *phwnd
+                    };
+                    let reserved_cell = grid_state.as_ref().and_then(|g| g.reserved_cell);
+                    (parent_hwnd_val, reserved_cell)
+                };
+
+                // Find the oldest non-parent, non-reserved window
+                let oldest = active_windows.iter()
+                    .filter(|(hwnd, _, _, _)| {
+                        Some(*hwnd as isize) != parent_hwnd_val && // not parent
+                        if let Some(ref grid_state) = grid_state.as_ref() {
+                            // not in reserved cell
+                            !grid_state.reserved_cell.map_or(false, |idx| grid_state.cells[idx].hwnd == Some(*hwnd))
+                        } else { true }
+                    })
+                    .min_by_key(|(hwnd, _, _, _)| hwnd_start_times.get(hwnd).cloned().unwrap_or(Instant::now()));
+
+                if let Some((evict_hwnd, evict_pid, _, _)) = oldest {
+                    println!("Evicting oldest HWND {:?} (PID: {}) to make room in grid", evict_hwnd, evict_pid);
+                    // Optionally, send WM_CLOSE or move it out of the grid
+                    unsafe {
+                        winapi::um::winuser::PostMessageW(
+                            *evict_hwnd,
+                            winapi::um::winuser::WM_CLOSE,
+                            0,
+                            0,
+                        );
+                    }
+                    // Remove from grid_state and hwnd_start_times now, but defer removal from active_windows
+                    if let Some(ref mut grid_state) = grid_state_arc.lock().unwrap().as_mut() {
+                        if let Some(idx) = grid_state.hwnd_to_cell.remove(&evict_hwnd).map(|(_, idx)| idx) {
+                            grid_state.cells[idx] = GridCell { hwnd: None, filled_at: None };
+                        }
+                    }
+                    hwnd_start_times.remove(evict_hwnd);
+                    // Defer removal from active_windows to after the borrow ends
+                    let evict_hwnd_val = *evict_hwnd;
+                    // Remove after the borrow ends
+                    drop(oldest);
+                    active_windows.retain(|(hwnd, _, _, _)| *hwnd != evict_hwnd_val);
+                } else {
+                    // No eligible window to evict
+                    break;
+                }
+            }
+
+            // Now promote as before, but only if there is a non-reserved, empty cell
+            while active_windows.len() < grid_slots {
+                let can_promote = if let Some(ref grid_state) = *grid_state {
+                    grid_state.cells.iter().enumerate().any(|(idx, c)| {
+                        c.hwnd.is_none() && Some(idx) != grid_state.reserved_cell
+                    })
+                } else {
+                    false
+                };
+                if !can_promote {
+                    break;
+                }
+                if let Some((hwnd, pid, class_name, bounds)) = staged_windows.pop_front() {
+                    println!("Promoting staged HWND {:?} (PID: {}) to grid", hwnd, pid);
+                    if let Some(ref mut grid_state_opt) = grid_state.as_mut() {
+                        let grid_state = grid_state_opt;
+                        let win_width = bounds.2;
+                        let win_height = bounds.3;
+                        let (cell_idx, new_x, new_y) = grid_state.next_position(
+                            win_width,
+                            win_height,
+                            fit_grid,
+                            grid_placement_mode,
+                        );
+                        // Move/resize window as before
+                        if fit_grid && class_name != "ConsoleWindowClass" {
+                            let cell_w = (grid_state.monitor_rect.right - grid_state.monitor_rect.left)
+                                / grid_state.cols as i32;
+                            let cell_h = (grid_state.monitor_rect.bottom - grid_state.monitor_rect.top)
+                                / grid_state.rows as i32;
+                            SetWindowPos(
+                                hwnd,
+                                std::ptr::null_mut(),
+                                new_x,
+                                new_y,
+                                cell_w,
+                                cell_h,
+                                SWP_NOZORDER,
+                            );
+                        } else {
+                            SetWindowPos(
+                                hwnd,
+                                std::ptr::null_mut(),
+                                new_x,
+                                new_y,
+                                0,
+                                0,
+                                SWP_NOSIZE | SWP_NOZORDER,
+                            );
+                        }
+
+                        // After moving, verify the window is at the expected position
+                        let mut rect = std::mem::zeroed();
+                        if winapi::um::winuser::GetWindowRect(hwnd, &mut rect) != 0 {
+                            let actual_x = rect.left;
+                            let actual_y = rect.top;
+                            if actual_x == new_x && actual_y == new_y {
+                                println!("Successfully promoted HWND {:?} to grid cell {}", hwnd, cell_idx);
+                                grid_state.cells[cell_idx] = GridCell {
+                                    hwnd: Some(hwnd),
+                                    filled_at: Some(Instant::now()),
+                                }; // Mark cell as occupied
+                                // if let Some(timeout) = timeout_secs {
+                                //     grid_state.cells[cell_idx].start_eviction_timer(cell_idx, timeout);
+                                // }
+                            } else {
+                                println!(
+                                    "Warning: Promoted HWND {:?} did not move to expected position (wanted: {},{} got: {},{})",
+                                    hwnd, new_x, new_y, actual_x, actual_y
+                                );
+                            }
+                        } else {
+                            println!(
+                                "Warning: Could not verify position for promoted HWND {:?}",
+                                hwnd
+                            );
+                        }
+                    }
+                    active_windows.push((hwnd, pid, class_name.clone(), bounds));
+                    hwnd_start_times.insert(hwnd, Instant::now());
+                } else {
+                    break;
+                }
+            }
         }
-
-        // After the follow_children loop, restore/show the parent window
-        if let Some(parent_hwnd) = gui.first().map(|(hwnd, _, _, _)| *hwnd) {
-            println!(
-                "Restoring and bringing parent HWND {:?} to front",
-                parent_hwnd
-            );
-            ShowWindow(parent_hwnd, winapi::um::winuser::SW_SHOWNORMAL);
-            winapi::um::winuser::SetForegroundWindow(parent_hwnd);
+        if !shake_handles.is_empty() {
+            println!("Waiting for {} shake handles to finish...", shake_handles.len());
+            for handle in shake_handles {
+                let _ = handle.join();
+            }
         }
-
-        winapi::um::handleapi::CloseHandle(sei.hProcess);
-    }
-    println!(
-        "Waiting for shake threads to finish... {}",
-        shake_handles.len()
-    );
-    for handle in shake_handles {
-        let _ = handle.join();
-    }
-    println!("All shake threads finished.");
-
-    Ok(())
+        println!("Finished processing windows.");
+        Ok(())
 }
 
+   
 fn flash_topmost(hwnd: HWND, duration_ms: u64) {
     use winapi::um::winuser::{
         HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetWindowPos,
@@ -1491,6 +2998,8 @@ fn hide_window_border(hwnd: HWND) {
 }
 
 use winapi::um::winuser::{FindWindowExW, SW_HIDE, SW_SHOW};
+use once_cell::sync::Lazy;
+use winapi::um::winuser::WindowFromPoint;
 
 fn hide_taskbar_on_monitor(monitor_index: i32) {
     unsafe {
@@ -1557,3 +3066,137 @@ fn show_taskbar_on_monitor(monitor_index: i32) {
         );
     }
 }
+impl GridCell {
+    fn start_eviction_timer(&self, idx: usize, timeout: u64) {
+        if let Some(hwnd) = self.hwnd {
+            let hwnd_val = hwnd as isize;
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(timeout));
+                    let hwnd = hwnd_val as HWND;
+                    println!("Evicting HWND {:?} from cell {} due to timeout (cell self-evict)", hwnd, idx);
+                    unsafe {
+                        winapi::um::winuser::PostMessageW(
+                            hwnd,
+                            winapi::um::winuser::WM_CLOSE,
+                            0,
+                            0,
+                        );
+                    }
+                        //*cell = GridCell { hwnd: None, filled_at: None };
+            });
+        }
+    }
+}
+
+
+unsafe extern "system" fn win_event_proc(
+    _hWinEventHook: HWINEVENTHOOK,
+    event: DWORD,
+    hwnd: HWND,
+    _idObject: c_long,
+    _idChild: c_long,
+    _dwEventThread: DWORD,
+    _dwmsEventTime: DWORD,
+) {
+        println!("\n\n\n\nwin_event_proc: event={} hwnd={:?}", event, hwnd);
+    if event == EVENT_OBJECT_DESTROY {
+                if let Some(ref tx) = HOOK_SENDER {
+                    println!("Sending HWND {:?} to channel", hwnd);
+            let _ = tx.send(hwnd as usize);
+        }
+        // if 
+        // GridState::with(|grid| {
+        //     if let Some((_, idx)) = grid.hwnd_to_cell.remove(&hwnd) {
+                println!("(HOOK) Window destroyed: HWND {:?}", hwnd);
+
+                // Print title, class, pid, and process runtime
+                let mut title = [0u16; 256];
+                let title_len = unsafe {
+                    winapi::um::winuser::GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32)
+                };
+                let title_str = if title_len > 0 {
+                    std::ffi::OsString::from_wide(&title[..title_len as usize])
+                        .to_string_lossy()
+                        .to_string()
+                } else {
+                    String::from("<no title>")
+                };
+
+                let mut class_name = [0u16; 256];
+                let class_name_len = unsafe {
+                    winapi::um::winuser::GetClassNameW(hwnd, class_name.as_mut_ptr(), class_name.len() as i32)
+                };
+                let class_name_str = if class_name_len > 0 {
+                    std::ffi::OsString::from_wide(&class_name[..class_name_len as usize])
+                        .to_string_lossy()
+                        .to_string()
+                } else {
+                    String::from("<unknown>")
+                };
+
+                let mut pid: u32 = 0;
+                unsafe { winapi::um::winuser::GetWindowThreadProcessId(hwnd, &mut pid) };
+
+                // Try to get process runtime (since PROGRAM_START)
+                let runtime = Instant::now().duration_since(*PROGRAM_START).as_secs();
+
+                println!(
+                    "(HOOK) Destroyed window info: Title: '{}', Class: '{}', PID: {}, Runtime: {}s",
+                    title_str, class_name_str, pid, runtime
+                );
+                // grid.cells[idx] = GridCell { hwnd: None, filled_at: None };
+        //     }
+        // });
+     }
+}
+
+// Call this after creating your grid_state:
+pub fn install_window_destroy_hook(_grid_state: Arc<Mutex<Option<GridState>>>) -> winapi::shared::windef::HWINEVENTHOOK {
+    println!("Installing window destroy hook...");
+    unsafe {
+        let hook = SetWinEventHook(
+            EVENT_OBJECT_DESTROY,
+            EVENT_OBJECT_DESTROY,
+            std::ptr::null_mut(),
+            Some(win_event_proc),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT,
+        );
+        // Start a message loop in a new thread so your main thread isn't blocked
+        std::thread::spawn(move || {
+            let mut msg = std::mem::zeroed();
+            while winapi::um::winuser::GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+                winapi::um::winuser::TranslateMessage(&msg);
+                winapi::um::winuser::DispatchMessageW(&msg);
+            }
+        });
+        hook
+    }
+}
+
+// pub fn kill_process_and_children(parent_pid: u32) {
+//     use winapi::um::processthreadsapi::OpenProcess;
+//     use winapi::um::winnt::PROCESS_TERMINATE;
+//     use winapi::um::processthreadsapi::TerminateProcess;
+//     use winapi::um::handleapi::CloseHandle;
+
+//     // 1. Get all child PIDs recursively
+//     let mut pids = get_child_pids(parent_pid);
+//     // 2. Add the parent itself
+//     pids.push(parent_pid);
+
+//     // 3. Kill each process
+//     for pid in pids {
+//         unsafe {
+//             let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+//             if !handle.is_null() {
+//                 println!("Killing PID {}", pid);
+//                 TerminateProcess(handle, 1);
+//                 CloseHandle(handle);
+//             } else {
+//                 println!("Failed to open PID {} for termination", pid);
+//             }
+//         }
+//     }
+// }
