@@ -3,11 +3,14 @@ use std::os::windows::ffi::OsStringExt;
 use winapi::shared::minwindef::{DWORD, FILETIME};
 use winapi::shared::windef::HWND;
 use winapi::um::handleapi::CloseHandle;
+use winapi::um::memoryapi::ReadProcessMemory;
 use winapi::um::processthreadsapi::{GetProcessTimes, OpenProcess};
 use winapi::um::psapi::GetProcessImageFileNameW;
 use winapi::um::winnt::{HANDLE, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
 use winapi::um::winuser::{EnumWindows, GetWindowThreadProcessId};
 
+pub mod gui;
+pub mod hwnd;
 // Example usage: find the oldest matching GUI app(s)
 // Usage: find_oldest_recent_apps(&file.to_string_lossy(), 1)
 // Returns the oldest (least recent) matching app(s)
@@ -318,13 +321,14 @@ pub fn filetime_to_unix_time(ft: FILETIME) -> u64 {
 pub fn find_most_recent_gui_apps(
     program_name: &str,
     num_recent: usize,
-    _parent_pid: Option<DWORD>,
+    parent_pid: Option<DWORD>,
     _launching_pid: Option<DWORD>,
 ) -> Vec<(HWND, u32, String, (i32, i32, i32, i32))> {
     unsafe {
         struct EnumData {
             windows: Vec<(HWND, u32, u64, String, (i32, i32, i32, i32))>,
             target_program_name: String,
+            parent_pid: Option<DWORD>,
         }
 
         extern "system" fn enum_windows_proc(hwnd: HWND, lparam: isize) -> i32 {
@@ -487,6 +491,13 @@ pub fn find_most_recent_gui_apps(
                             "Executable name '{}' matches target with extension '{}'.",
                             exe_name, data.target_program_name
                         );
+
+                        if let Some(cmdline_str) = get_cmdline_for_pid(process_id) {
+                            println!(
+                                "Command-line arguments for PID {}: {}",
+                                process_id, cmdline_str
+                            );
+                        }
                     } else {
                         return 1; // Continue enumeration
                     }
@@ -499,6 +510,38 @@ pub fn find_most_recent_gui_apps(
                     "Executable name '{}' matches target '{}'.",
                     exe_name, data.target_program_name
                 );
+
+                // Get the command line of the target process, not the current process
+
+                if let Some(cmdline_str) = get_cmdline_for_pid(process_id) {
+                    println!(
+                        "Command-line arguments for PID {}: {}",
+                        process_id, cmdline_str
+                    );
+                }
+
+                // Filter by command-line arguments: keep only if it contains "--w-pool-manager" and our parent_pid
+                if let Some(cmdline_str) = get_cmdline_for_pid(process_id) {
+                    if cmdline_str.contains("--w-pool-manager") {
+                        if let Some(parent_pid) = data.parent_pid {
+                            if cmdline_str.contains(&parent_pid.to_string()) {
+                                println!(
+                                    "PID {} has --w-pool-manager and parent_pid {} in command line: {}",
+                                    process_id, parent_pid, cmdline_str
+                                );
+                                // } else {
+                                //     // Does not contain parent_pid, skip this window
+                                //     return 1;
+                            }
+                        } else {
+                            // No parent_pid specified, just keep if --w-pool-manager is present
+                            println!(
+                                "PID {} has --w-pool-manager in command line: {}",
+                                process_id, cmdline_str
+                            );
+                        }
+                    }
+                }
             }
 
             // Get the process creation time
@@ -627,6 +670,7 @@ pub fn find_most_recent_gui_apps(
         let mut data = EnumData {
             windows: Vec::new(),
             target_program_name: program_name.to_string(),
+            parent_pid: parent_pid,
         };
 
         println!("Starting enumeration for program name: {}", program_name);
@@ -652,5 +696,207 @@ pub fn find_most_recent_gui_apps(
             result
         );
         result
+    }
+}
+
+pub fn kill_process_and_children(parent_pid: u32) {
+    use winapi::um::handleapi::CloseHandle;
+    use winapi::um::processthreadsapi::OpenProcess;
+    use winapi::um::processthreadsapi::TerminateProcess;
+    use winapi::um::winnt::PROCESS_TERMINATE;
+
+    // 1. Get all child PIDs recursively
+    let mut pids = get_child_pids(parent_pid);
+    // 2. Add the parent itself
+    pids.push(parent_pid);
+
+    // 3. Kill each process
+    for pid in pids {
+        unsafe {
+            let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+            if !handle.is_null() {
+                println!("Killing PID {}", pid);
+                TerminateProcess(handle, 1);
+                CloseHandle(handle);
+            } else {
+                println!("Failed to open PID {} for termination", pid);
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub fn get_child_pids(parent_pid: u32) -> Vec<u32> {
+    use winapi::shared::minwindef::FALSE;
+    use winapi::um::handleapi::CloseHandle;
+
+    use winapi::um::tlhelp32::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32, Process32First, Process32Next, TH32CS_SNAPPROCESS,
+    };
+
+    let mut child_pids = Vec::new();
+    let mut stack = vec![parent_pid];
+
+    unsafe {
+        // Take a snapshot of all processes
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot.is_null() {
+            eprintln!("Failed to create process snapshot");
+            return child_pids;
+        }
+
+        let mut entry: PROCESSENTRY32 = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32>() as u32;
+
+        // Collect all process entries into a Vec for easier traversal
+        let mut all_entries = Vec::new();
+        if Process32First(snapshot, &mut entry) != FALSE {
+            loop {
+                all_entries.push(entry);
+                if Process32Next(snapshot, &mut entry) == FALSE {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snapshot);
+
+        // Use a stack for DFS to collect all descendants
+        while let Some(pid) = stack.pop() {
+            for e in all_entries.iter() {
+                if e.th32ParentProcessID == pid && !child_pids.contains(&e.th32ProcessID) {
+                    child_pids.push(e.th32ProcessID);
+                    stack.push(e.th32ProcessID);
+                }
+            }
+        }
+    }
+
+    child_pids
+}
+
+use winapi::shared::ntdef::UNICODE_STRING;
+
+/// Get the command line of a process by PID using winapi and direct memory reading.
+/// Returns None if not accessible.
+pub fn get_cmdline_for_pid(pid: u32) -> Option<String> {
+    unsafe {
+        // Open the process
+        let h_process = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid);
+        if h_process.is_null() {
+            return None;
+        }
+
+        // Get PROCESS_BASIC_INFORMATION (undocumented struct)
+        #[repr(C)]
+        struct PROCESS_BASIC_INFORMATION {
+            Reserved1: *mut std::ffi::c_void,
+            PebBaseAddress: *mut std::ffi::c_void,
+            Reserved2: [*mut std::ffi::c_void; 2],
+            UniqueProcessId: *mut std::ffi::c_void,
+            Reserved3: *mut std::ffi::c_void,
+        }
+
+        // NtQueryInformationProcess is not in winapi, so we declare it manually
+        type NtQueryInformationProcessType = unsafe extern "system" fn(
+            winapi::um::winnt::HANDLE,
+            u32,
+            *mut std::ffi::c_void,
+            u32,
+            *mut u32,
+        ) -> i32;
+
+        let ntdll = winapi::um::libloaderapi::GetModuleHandleA(b"ntdll.dll\0".as_ptr() as _);
+        if ntdll.is_null() {
+            CloseHandle(h_process);
+            return None;
+        }
+        let proc_addr = winapi::um::libloaderapi::GetProcAddress(
+            ntdll,
+            b"NtQueryInformationProcess\0".as_ptr() as _,
+        );
+        if proc_addr.is_null() {
+            CloseHandle(h_process);
+            return None;
+        }
+        let nt_query_information_process: NtQueryInformationProcessType =
+            std::mem::transmute(proc_addr);
+
+        let mut pbi: PROCESS_BASIC_INFORMATION = std::mem::zeroed();
+        let mut return_len = 0u32;
+        let status = nt_query_information_process(
+            h_process,
+            0, // ProcessBasicInformation
+            &mut pbi as *mut _ as *mut _,
+            std::mem::size_of::<PROCESS_BASIC_INFORMATION>() as u32,
+            &mut return_len,
+        );
+        if status != 0 {
+            CloseHandle(h_process);
+            return None;
+        }
+
+        // Read PEB
+        #[repr(C)]
+        struct PEB {
+            Reserved1: [u8; 2],
+            BeingDebugged: u8,
+            Reserved2: [u8; 1],
+            Reserved3: [*mut std::ffi::c_void; 2],
+            Ldr: *mut std::ffi::c_void,
+            ProcessParameters: *mut RTL_USER_PROCESS_PARAMETERS,
+        }
+        #[repr(C)]
+        struct RTL_USER_PROCESS_PARAMETERS {
+            Reserved1: [u8; 16],
+            Reserved2: [*mut std::ffi::c_void; 10],
+            ImagePathName: UNICODE_STRING,
+            CommandLine: UNICODE_STRING,
+        }
+
+        let mut peb: PEB = std::mem::zeroed();
+        let mut bytes_read = 0;
+        if winapi::um::memoryapi::ReadProcessMemory(
+            h_process,
+            pbi.PebBaseAddress as *mut winapi::ctypes::c_void,
+            &mut peb as *mut _ as *mut _,
+            std::mem::size_of::<PEB>(),
+            &mut bytes_read,
+        ) == 0
+        {
+            CloseHandle(h_process);
+            return None;
+        }
+
+        // Read RTL_USER_PROCESS_PARAMETERS
+        let mut upp: RTL_USER_PROCESS_PARAMETERS = std::mem::zeroed();
+        if ReadProcessMemory(
+            h_process,
+            peb.ProcessParameters as *mut _,
+            &mut upp as *mut _ as *mut _,
+            std::mem::size_of::<RTL_USER_PROCESS_PARAMETERS>(),
+            &mut bytes_read,
+        ) == 0
+        {
+            CloseHandle(h_process);
+            return None;
+        }
+
+        // Read the command line UNICODE_STRING buffer
+        let len = upp.CommandLine.Length as usize / 2;
+        let mut buffer = vec![0u16; len];
+        if ReadProcessMemory(
+            h_process,
+            upp.CommandLine.Buffer as *mut _,
+            buffer.as_mut_ptr() as *mut _,
+            upp.CommandLine.Length as usize,
+            &mut bytes_read,
+        ) == 0
+        {
+            CloseHandle(h_process);
+            return None;
+        }
+
+        CloseHandle(h_process);
+        Some(String::from_utf16_lossy(&buffer))
     }
 }
