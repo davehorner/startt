@@ -1,6 +1,10 @@
-﻿25/05/24|ee736d0|0.1.12
-## [0.1.12](https://github.com/davehorner/startt/compare/v0.1.11...v0.1.12) - 2025-05-24
+﻿25/05/27|8f32422|0.1.13 0.61.1
+## [0.1.13](https://github.com/davehorner/startt/compare/v0.1.12...v0.1.13) - 2025-05-27
 
 ### Added
 
-- *(grid)* enable full monitor area fitting and improve console resizing; consoles (cmd.exe) are special and can't do extended sizes.
+- add --gui option for launching the egui app
+
+### Other
+
+- untangle this mess.

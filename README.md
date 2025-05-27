@@ -45,6 +45,8 @@ startt [options] <executable|document|URL> [args...]
   Set the shake animation duration in milliseconds (default: 2000ms).
 - `-dbg` or `--debug-chrome`  
   Rewrite any URL arguments to use the `debugchrome://` prefix for [debugchrome-cdp-rs](https://crates.io/crates/debugchrome-cdp-rs) support.
+- `--gui`  
+  Launch the graphical user interface for managing grids, running demos, and launching commands.
 
 **Examples:**
 
@@ -69,6 +71,9 @@ startt -f -g1x5 powershell -NoProfile -WindowStyle Normal -Command "1..5 | ForEa
 ```
 
 When grid mode is enabled, each window (parent or child) is moved to the next cell in the grid, wrapping around as needed. With `--fit-grid`, each window is also resized to fill its cell. This works for both the initial window and any new windows found in follow mode.
+
+[cargo-e](https://github.com/davehorner/cargo-e) provides a graphical panic window;
+[![startt + cargo-e + bevy + 5x5](https://github.com/davehorner/cargo-e_walkthrus/raw/main/startt_cargo-e_bevy_runall_5x5_small.jpg)](https://github.com/davehorner/cargo-e_walkthrus/tree/main)
 
 See also:  
 - A protocol‐handler for launching & controlling Chrome via CDP  
