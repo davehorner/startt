@@ -92,7 +92,9 @@ impl eframe::App for StarttApp {
         }
 
         let bevy_demo_dir = r"C:\w\demos\bevy";
-        let bevy_demo_exists = std::path::Path::new(bevy_demo_dir).exists();
+        let bevy_demo_exists = std::path::Path::new(bevy_demo_dir).exists() && {
+            std::env::set_current_dir(bevy_demo_dir).is_ok() && is_valid_cargo_project()
+        };
 
         // 2. If a new command is pending, spawn the process and output thread
         if let Some(args) = self.pending_cmd.take() {
@@ -382,12 +384,32 @@ impl eframe::App for StarttApp {
                     std::thread::spawn(move || {
                         let setup_cmd = "git clone https://github.com/bevyengine/bevy.git && cd bevy && cargo install cargo-e startt";
                         let mut child = if cfg!(target_os = "windows") {
-                            Command::new("cmd").args(["/C", setup_cmd]).current_dir("C:/w/demos").stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()
+                            Command::new("cmd")
+                                .args(["/C", setup_cmd])
+                                .current_dir("C:/w/demos")
+                                .stdout(Stdio::piped())
+                                .stderr(Stdio::piped())
+                                .spawn()
                         } else {
-                            Command::new("sh").args(["-c", setup_cmd]).current_dir("C:/w/demos").stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()
-                        }.expect("Failed to run setup command");
+                            Command::new("sh")
+                                .args(["-c", setup_cmd])
+                                .current_dir("C:/w/demos")
+                                .stdout(Stdio::piped())
+                                .stderr(Stdio::piped())
+                                .spawn()
+                        }
+                        .expect("Failed to run setup command");
+
                         let stdout = child.stdout.take().unwrap();
                         let reader = BufReader::new(stdout);
+                        for line in reader.lines() {
+                            if let Ok(line) = line {
+                                let _ = setup_tx.send(line);
+                            }
+                        }
+
+                        let stderr = child.stderr.take().unwrap();
+                        let reader = BufReader::new(stderr);
                         for line in reader.lines() {
                             if let Ok(line) = line {
                                 let _ = setup_tx.send(line);
@@ -551,3 +573,29 @@ pub fn fun_name() -> Option<std::result::Result<(), std::io::Error>> {
 //         // });
 //      }
 // }
+
+pub fn is_valid_cargo_project() -> bool {
+    let output = Command::new("cargo")
+        .arg("metadata")
+        .arg("--format-version")
+        .arg("1")
+        .output();
+
+    match output {
+        Ok(output) if output.status.success() => {
+            // println!("Valid Cargo project detected.");
+            true
+        }
+        Ok(output) => {
+            // eprintln!(
+            //     "Cargo metadata failed with status: {}",
+            //     output.status
+            // );
+            false
+        }
+        Err(err) => {
+            eprintln!("Failed to run cargo metadata: {}", err);
+            false
+        }
+    }
+}
