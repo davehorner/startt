@@ -372,7 +372,7 @@ impl GridState {
     /// Returns a Vec of HashMaps for each cell, including cell index, cell HWND, pixel owner HWND,
     /// and additional data: cell title, class, pid, pixel owner title, class, pid.
     pub fn determine_cell_owners(
-        &self,
+        &mut self,
     ) -> Vec<std::collections::HashMap<&'static str, serde_json::Value>> {
         let pixel_owners = self.cell_pixel_owners();
         // Open cells: those where cell_hwnd is None (from cell_pixel_owners)
@@ -390,8 +390,21 @@ impl GridState {
         let mut result = Vec::with_capacity(pixel_owners.len());
         for (i, (idx, cell_hwnd, pixel_owner_hwnd)) in pixel_owners.iter().enumerate() {
             // Helper to get window info
-            let get_info = |hwnd: Option<HWND>| {
+            let mut get_info = |hwnd: Option<HWND>| {
                 if let Some(hwnd) = hwnd {
+                    unsafe {
+                        if winapi::um::winuser::IsWindow(hwnd) == 0
+                            || winapi::um::winuser::IsWindowVisible(hwnd) == 0
+                        {
+                            // Window is gone or not visible, cell is available
+                            self.cells[*idx] = GridCell {
+                                hwnd: None,
+                                filled_at: None,
+                            };
+                            return (String::new(), String::new(), 0);
+                        }
+                    }
+
                     // Title
                     let mut title = [0u16; 256];
                     let title_len = unsafe {
@@ -639,34 +652,35 @@ impl GridState {
             }
         }
 
-        let (cell_idx, new_x, new_y) =
-            if let (Some(idx), Some((x, y))) = (selected_idx, selected_cell) {
-                (idx, x, y)
+        let (cell_idx, new_x, new_y) = if let (Some(idx), Some((x, y))) =
+            (selected_idx, selected_cell)
+        {
+            (idx, x, y)
+        } else {
+            // Fallback: use next_position as before (may evict/overlay if all cells are busy)
+            let fallback = self.next_position(win_width, win_height, fit_grid, placement_mode);
+            if let Some((fallback_idx, fallback_x, fallback_y)) = fallback {
+                eprintln!(
+                    "Warning: {:?} All grid cells are busy or failed checks, using fallback cell {}",
+                    hwnd, fallback_idx
+                );
+                self.check_and_fix_grid_sync();
+                return Some(fallback_idx);
             } else {
-                // Fallback: use next_position as before (may evict/overlay if all cells are busy)
-                let fallback = self.next_position(win_width, win_height, fit_grid, placement_mode);
-                if let Some((fallback_idx, fallback_x, fallback_y)) = fallback {
-                    eprintln!(
-                        "Warning: All grid cells are busy or failed checks, using fallback cell {}",
-                        fallback_idx
-                    );
-                    self.check_and_fix_grid_sync();
-                    return Some(fallback_idx);
-                } else {
-                    eprintln!(
-                        "No available grid cell found for HWND {:?}, assignment failed.",
-                        hwnd
-                    );
-                    return None;
-                }
-                //   Only assign if the fallback cell is actually available and not reserved
-                // if self.cells.get(fallback_idx).map_or(false, |c| c.hwnd.is_none() || c.hwand.is_some(0)) && Some(fallback_idx) != self.reserved_cell {
-                //     (fallback_idx, fallback_x, fallback_y)
-                // } else {
-                //     eprintln!("No available grid cell found for HWND {:?}, assignment failed.", hwnd);
-                //     return None;
-                // }
-            };
+                eprintln!(
+                    "No available grid cell found for HWND {:?}, assignment failed.",
+                    hwnd
+                );
+                return None;
+            }
+            //   Only assign if the fallback cell is actually available and not reserved
+            // if self.cells.get(fallback_idx).map_or(false, |c| c.hwnd.is_none() || c.hwand.is_some(0)) && Some(fallback_idx) != self.reserved_cell {
+            //     (fallback_idx, fallback_x, fallback_y)
+            // } else {
+            //     eprintln!("No available grid cell found for HWND {:?}, assignment failed.", hwnd);
+            //     return None;
+            // }
+        };
 
         // Move/resize as before...
         let min_x = self.monitor_rect.left;
@@ -1532,10 +1546,31 @@ fn main() -> windows::core::Result<()> {
     let mut retain_parent_focus = false;
     let mut retain_launcher_focus = false;
     let mut keep_open = false; // <-- Add this near your other flags
+    let mut num_recent: usize = 1; // Default value
+    let mut sleep_duration_ms: u64 = 0;
+    let mut use_find_oldest = false;
     while let Some(arg) = args.next() {
         let arg_str = arg.to_string_lossy();
-        if arg_str == "-f" || arg_str == "--follow" {
+        if arg_str == "--find-oldest" || arg_str == "-fo" {
+            use_find_oldest = true;
+        } else if arg_str == "--sleep-duration" || arg_str == "-sd" {
+            let dur_arg = args
+                .next()
+                .expect("Expected milliseconds after --sleep-duration/-sd");
+            sleep_duration_ms = dur_arg
+                .to_string_lossy()
+                .parse()
+                .expect("Invalid sleep duration value");
+        } else if arg_str == "-f" || arg_str == "--follow" {
             follow_children = true;
+        } else if arg_str == "--num-recent" || arg_str == "-nr" {
+            let num_arg = args
+                .next()
+                .expect("Expected a number after --num-recent/-nr");
+            num_recent = num_arg
+                .to_string_lossy()
+                .parse()
+                .expect("Invalid number for --num-recent/-nr");
         } else if arg_str == "-F" || arg_str == "--follow-forver" {
             follow_children = true;
             follow_forver = true;
@@ -1861,23 +1896,25 @@ fn main() -> windows::core::Result<()> {
         println!("Launched file = {:?}", file);
         println!("Launching: file={:?} params={:?}", file, params);
         WaitForInputIdle(sei.hProcess, winapi::um::winbase::INFINITE);
-        sleep(Duration::from_millis(1000));
-        let mut gui = if follow_children {
+        if sleep_duration_ms > 0 {
+            sleep(Duration::from_millis(sleep_duration_ms));
+        }
+        let mut gui = if use_find_oldest || follow_children {
             startt::find_oldest_recent_apps(
                 &file.to_string_lossy(),
-                1,
+                num_recent,
                 Some(parent_pid),
                 Some(launching_pid),
             )
         } else {
             startt::find_most_recent_gui_apps(
                 &file.to_string_lossy(),
-                1,
+                num_recent,
                 Some(parent_pid),
                 Some(launching_pid),
             )
         };
-
+        let mut parent_pids: HashSet<u32> = HashSet::new();
         if follow_children {
             let handle = OpenProcess(winapi::um::winnt::SYNCHRONIZE, 0, parent_pid);
             if !handle.is_null() {
@@ -1928,22 +1965,40 @@ fn main() -> windows::core::Result<()> {
                     }
                 } else {
                     println!("Parent process {} has terminated. Exiting.", parent_pid);
-                    gui = startt::find_most_recent_gui_apps(
-                        &file.to_string_lossy(),
-                        1,
-                        Some(parent_pid),
-                        Some(launching_pid),
-                    );
+                    let gui = if use_find_oldest {
+                        startt::find_oldest_recent_apps(
+                            &file.to_string_lossy(),
+                            num_recent,
+                            Some(parent_pid),
+                            Some(launching_pid),
+                        )
+                    } else {
+                        startt::find_most_recent_gui_apps(
+                            &file.to_string_lossy(),
+                            num_recent,
+                            Some(parent_pid),
+                            Some(launching_pid),
+                        )
+                    };
                 }
                 CloseHandle(handle);
             } else {
                 println!("Parent process {} has terminated. Exiting.", parent_pid);
-                gui = startt::find_most_recent_gui_apps(
-                    &file.to_string_lossy(),
-                    1,
-                    Some(parent_pid),
-                    Some(launching_pid),
-                );
+                let gui = if use_find_oldest {
+                    startt::find_oldest_recent_apps(
+                        &file.to_string_lossy(),
+                        num_recent,
+                        Some(parent_pid),
+                        Some(launching_pid),
+                    )
+                } else {
+                    startt::find_most_recent_gui_apps(
+                        &file.to_string_lossy(),
+                        num_recent,
+                        Some(parent_pid),
+                        Some(launching_pid),
+                    )
+                };
             }
         }
         // Create grid state if needed
@@ -1959,6 +2014,7 @@ fn main() -> windows::core::Result<()> {
         };
 
         for (i, (hwnd, pid, class_name, bounds)) in gui.clone().into_iter().enumerate() {
+            parent_pids.insert(pid);
             // class_name here is a String
             let is_console = class_name == "ConsoleWindowClass";
 
@@ -2009,8 +2065,10 @@ fn main() -> windows::core::Result<()> {
                         if phwnd == 0 {
                             println!("No parent HWND found, using 0 as placeholder.");
                             *parent_hwnd.lock().unwrap() = Some(hwnd as isize);
-                            // let mut pid: u32 = 0;
-                            // unsafe { winapi::um::winuser::GetWindowThreadProcessId(hwnd, &mut pid); }
+                            let mut pid: u32 = 0;
+                            unsafe {
+                                winapi::um::winuser::GetWindowThreadProcessId(hwnd, &mut pid);
+                            }
                             parent_pid = pid;
                         } else if phwnd != hwnd as isize {
                             println!(
@@ -2068,13 +2126,13 @@ fn main() -> windows::core::Result<()> {
 
                         // Now you can safely call with/set_parent_cell
                         GridState::with(|g| {
-                            g.ensure_clean_desktop();
-                            g.print_desktop_cells();
+                            // g.ensure_clean_desktop();
                             g.set_parent_cell(reserved_cell, hwnd);
                             g.set_parent_title(
                                 params.contains("cargo-e")
                                     || file.to_string_lossy().contains("cargo-e"),
                             );
+                            g.print_desktop_cells();
                             // let result = g.assign_window_to_grid_cell(
                             //     hwnd,
                             //     fit_grid,
@@ -2493,8 +2551,11 @@ fn main() -> windows::core::Result<()> {
         let failed_hwnds: HashMap<isize, u32> = HashMap::new();
         const MAX_HWND_RETRIES: u32 = 3;
         let failed_pids: HashSet<u32> = HashSet::new();
-        let mut last_child_pids: Vec<u32> = Vec::new();
+        let last_child_pids: Vec<u32> = Vec::new();
         let mut last_occupancy: Option<Vec<Option<HWND>>> = None;
+        let mut prior_cell_info: Option<
+            Vec<std::collections::HashMap<&'static str, serde_json::Value>>,
+        > = None;
 
         // --- Child windows in follow_children loop ---
         while follow_children && running.load(Ordering::SeqCst) {
@@ -2517,18 +2578,22 @@ fn main() -> windows::core::Result<()> {
             // println!("Child PIDs: {:?}", child_pids);
 
             // Use a HashSet to avoid duplicates and for faster lookup
-            let mut child_pids: HashSet<u32> =
-                startt::get_child_pids(parent_pid).into_iter().collect();
+            let mut child_pids: HashSet<u32> = HashSet::new();
+
+            // Iterate over each parent PID and collect its child PIDs
+            for parent_pid in &parent_pids {
+                let parent_child_pids = startt::get_child_pids(*parent_pid);
+                child_pids.extend(parent_child_pids.into_iter());
+            }
+
+            // Add ETW-tracked PIDs
             let etw_pids = tracked_pids.lock().unwrap();
             child_pids.extend(etw_pids.iter().copied());
 
-            // Only print if changed
-            let mut child_pids_vec: Vec<u32> = child_pids.iter().copied().collect();
-            child_pids_vec.sort_unstable();
-            if child_pids_vec != last_child_pids {
-                println!("Child PIDs (snapshot + ETW): {:?}", child_pids_vec);
-                last_child_pids = child_pids_vec.clone();
-            }
+            // Add all parent PIDs to the child_pids set
+            child_pids.extend(parent_pids.iter().copied());
+
+            // println!("Child PIDs (snapshot + ETW + parent/launcher): {:?}", child_pids);
 
             if !follow_forver {
                 // Check if any tracked process is still running OR parent HWND is still valid
@@ -2563,7 +2628,7 @@ fn main() -> windows::core::Result<()> {
                     std::process::exit(0);
                 }
             }
-            println!("Enumerating child windows for PIDs: {:?}", child_pids);
+            // println!("Enumerating child windows for PIDs: {:?}", child_pids);
             // Use grid_state's DashMap to track HWNDs and their cell indices
             let mut hwnd_pid_map: HashMap<HWND, u32> = HashMap::new();
             extern "system" fn enum_windows_proc(hwnd: HWND, lparam: isize) -> i32 {
@@ -2580,46 +2645,47 @@ fn main() -> windows::core::Result<()> {
             unsafe {
                 EnumWindows(Some(enum_windows_proc), &mut data as *mut _ as isize);
             }
-            println!("hwnd_pid_map: {:?}", hwnd_pid_map);
+            // println!("hwnd_pid_map: {:?}", hwnd_pid_map);
 
-            GridState::with_grid_state(|g| g.print_desktop_cells());
-            // Print a grid of cell geometry and occupancy using determine_cell_owners
             GridState::with_grid_state(|g| {
                 let cell_info = g.determine_cell_owners();
-                let rows = g.rows as usize;
-                let cols = g.cols as usize;
-                println!("Grid geometry ({}x{}):", rows, cols);
-                for row in 0..rows {
-                    for col in 0..cols {
-                        let idx = row * cols + col;
-                        if let Some(info) = cell_info.get(idx) {
-                            let cell_hwnd =
-                                info.get("cell_hwnd").and_then(|v| v.as_u64()).unwrap_or(0);
-                            let cell_title = info
-                                .get("cell_title")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
-                            if cell_hwnd == 0 {
-                                print!("[{:2}: free] ", idx);
+                if prior_cell_info.as_ref() != Some(&cell_info) {
+                    prior_cell_info = Some(cell_info.clone()); // Update prior_cell_info
+                    let rows = g.rows as usize;
+                    let cols = g.cols as usize;
+                    println!("Grid geometry ({}x{}):", rows, cols);
+                    for row in 0..rows {
+                        for col in 0..cols {
+                            let idx = row * cols + col;
+                            if let Some(info) = cell_info.get(idx) {
+                                let cell_hwnd =
+                                    info.get("cell_hwnd").and_then(|v| v.as_u64()).unwrap_or(0);
+                                let cell_title = info
+                                    .get("cell_title")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                if cell_hwnd == 0 {
+                                    print!("[{:2}: free] ", idx);
+                                } else {
+                                    print!("[{:2}: {:X} '{}'] ", idx, cell_hwnd, cell_title);
+                                }
                             } else {
-                                print!("[{:2}: {:X} '{}'] ", idx, cell_hwnd, cell_title);
+                                print!("[{:2}: ???] ", idx);
                             }
-                        } else {
-                            print!("[{:2}: ???] ", idx);
                         }
+                        println!();
                     }
-                    println!();
-                }
-                // Get open cells from the first map
-                if let Some(first) = cell_info.first() {
-                    if let Some(open_cells) = first.get("open_cells").and_then(|v| v.as_array()) {
-                        let open_indices: Vec<_> =
-                            open_cells.iter().filter_map(|v| v.as_u64()).collect();
-                        println!("Open/free cells: {:?}", open_indices);
+                    // Get open cells from the first map
+                    if let Some(first) = cell_info.first() {
+                        if let Some(open_cells) = first.get("open_cells").and_then(|v| v.as_array())
+                        {
+                            let open_indices: Vec<_> =
+                                open_cells.iter().filter_map(|v| v.as_u64()).collect();
+                            println!("Open/free cells: {:?}", open_indices);
+                        }
                     }
                 }
             });
-
             let open_indices = GridState::with_grid_state(|g| {
                 let cell_info = g.determine_cell_owners();
                 if let Some(first) = cell_info.first() {
@@ -2636,7 +2702,7 @@ fn main() -> windows::core::Result<()> {
                 if !indices.is_empty() {
                     GridState::with_grid_state(|g| {
                         for (hwnd, pid) in hwnd_pid_map.iter() {
-                            println!("Assigning HWND {:?} (PID: {}) to grid cell", hwnd, pid);
+                            // println!("Assigning HWND {:?} (PID: {}) to grid cell", hwnd, pid);
                             if g.is_hwnd_eligible(
                                 *hwnd,
                                 *pid,
@@ -2653,7 +2719,7 @@ fn main() -> windows::core::Result<()> {
                                     retain_launcher_focus,
                                     timeout_secs,
                                 );
-                                println!("Result of assignment: {:?}", result);
+                                // println!("Result of assignment: {:?}", result);
                             }
                         }
                     });

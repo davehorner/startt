@@ -23,7 +23,6 @@ use winapi::um::handleapi::CloseHandle;
 use winapi::um::tlhelp32::{
     CreateToolhelp32Snapshot, PROCESSENTRY32, Process32First, Process32Next, TH32CS_SNAPPROCESS,
 };
-use winapi::um::winnt::HANDLE;
 // use winapi::um::winnt::{PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
 use winapi::um::winuser::SWP_NOSIZE;
 use winapi::um::winuser::SWP_NOZORDER;
@@ -34,11 +33,7 @@ use winapi::um::winuser::{
 };
 use winapi::um::winuser::{EnumWindows, GetWindowThreadProcessId};
 
-unsafe extern "system" {
-    fn WaitForInputIdle(hProcess: HANDLE, dwMilliseconds: u32) -> u32;
-}
-
-pub fn flash_topmost(hwnd: HWND, duration_ms: u64) {
+pub unsafe fn flash_topmost(hwnd: HWND, duration_ms: u64) {
     use winapi::um::winuser::{
         HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetWindowPos,
     };
@@ -68,7 +63,7 @@ pub fn flash_topmost(hwnd: HWND, duration_ms: u64) {
     }
 }
 
-pub fn hide_window_title_bar(hwnd: HWND) {
+pub unsafe fn hide_window_title_bar(hwnd: HWND) {
     use winapi::um::winuser::{
         GWL_STYLE, GetWindowLongW, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
         SetWindowLongW, SetWindowPos, WS_CAPTION, WS_SYSMENU,
@@ -92,7 +87,7 @@ pub fn hide_window_title_bar(hwnd: HWND) {
     }
 }
 
-pub fn hide_window_border(hwnd: HWND) {
+pub unsafe fn hide_window_border(hwnd: HWND) {
     use winapi::um::winuser::{
         GWL_STYLE, GetWindowLongW, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
         SetWindowLongW, SetWindowPos, WS_BORDER, WS_THICKFRAME,
@@ -355,7 +350,7 @@ pub fn find_hwnd_by_pid(pid: u32) -> Option<HWND> {
     }
 }
 
-pub fn shake_window(hwnd: HWND, intensity: i32, duration_ms: u64) {
+pub unsafe fn shake_window(hwnd: HWND, intensity: i32, duration_ms: u64) {
     unsafe {
         // Bring the window to the front
         winapi::um::winuser::SetForegroundWindow(hwnd);

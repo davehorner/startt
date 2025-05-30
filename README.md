@@ -33,6 +33,8 @@ startt [options] <executable|document|URL> [args...]
   Keep watching for and shaking new child windows.
 - `-F` or `--follow-forever`  
   Keep watching for and shaking new child windows even after the parent has closed.
+- `--find-oldest`  
+  Use the "oldest" logic instead of most recent.
 - `-t SECONDS` or `--timeout SECONDS`  
   Specify the number of seconds each window should remain open before a quit message is sent to it.
 - `-hT` or `--hide-title-bar`  
@@ -47,6 +49,8 @@ startt [options] <executable|document|URL> [args...]
   Rewrite any URL arguments to use the `debugchrome://` prefix for [debugchrome-cdp-rs](https://crates.io/crates/debugchrome-cdp-rs) support.
 - `--gui`  
   Launch the graphical user interface for managing grids, running demos, and launching commands.
+- `--num-recent COUNT`  
+  Specify the number of recent windows or processes (parents) to track and process (default: 1).
 
 **Examples:**
 
