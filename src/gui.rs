@@ -8,7 +8,6 @@ use std::time::{Duration, Instant};
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct StarttApp {
-    message: String,
     #[serde(skip)]
     pub cmdline: String,
     #[serde(skip)]
@@ -16,7 +15,7 @@ pub(crate) struct StarttApp {
     #[serde(skip)]
     output_lines: Vec<String>,
     #[serde(skip)]
-    pending_cmd: Option<Vec<String>>, // <-- Add this
+    pending_cmd: Option<PendingCmd>, // <-- Change type to PendingCmd
     #[serde(skip)]
     child: Arc<Mutex<Option<std::process::Child>>>,
     #[serde(skip)]
@@ -27,6 +26,10 @@ pub(crate) struct StarttApp {
     stick_to_bottom: Arc<Mutex<bool>>,
     #[serde(skip)]
     force_scroll_jump: Option<OutputMode>,
+    #[serde(skip)]
+    detached: bool,
+    #[serde(skip)]
+    heading: String,
 }
 
 // Manual Default implementation because Instant does not implement Default
@@ -42,7 +45,8 @@ impl Default for StarttApp {
             last_scroll_interaction: Arc::new(Mutex::new(Some(Instant::now()))),
             stick_to_bottom: Arc::new(Mutex::new(true)),
             force_scroll_jump: None,
-            message: format!("startt v{}{}", env!("CARGO_PKG_VERSION"), {
+            detached: true,
+            heading: format!("startt v{}{}", env!("CARGO_PKG_VERSION"), {
                 let (y, m, d) = (
                     option_env!("BUILD_YEAR"),
                     option_env!("BUILD_MONTH"),
@@ -80,107 +84,154 @@ const MAX_OUTPUT_LINES: usize = 1000;
 
 impl eframe::App for StarttApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 1. Drain output lines from the channel (lock free)
-        if let Some(rx) = &self.output_lines_rx {
-            while let Ok(line) = rx.try_recv() {
-                self.output_lines.push(line);
-                if self.output_lines.len() > MAX_OUTPUT_LINES {
-                    let excess = self.output_lines.len() - MAX_OUTPUT_LINES;
-                    self.output_lines.drain(0..excess);
+        // Drain output lines from the channel (lock free)
+        // if !self.detached {
+            if let Some(rx) = &self.output_lines_rx {
+                while let Ok(line) = rx.try_recv() {
+                    self.output_lines.push(line);
+                    if self.output_lines.len() > MAX_OUTPUT_LINES {
+                        let excess = self.output_lines.len() - MAX_OUTPUT_LINES;
+                        self.output_lines.drain(0..excess);
+                    }
                 }
             }
-        }
+        // }
 
+        // Only check for Bevy demo existence on first launch
+        static mut CHECKED_BEFORE: bool = false;
+        static mut BEVY_DEMO_EXISTS: bool = false;
         let bevy_demo_dir = r"C:\w\demos\bevy";
-        let bevy_demo_exists = std::path::Path::new(bevy_demo_dir).exists() && {
-            std::env::set_current_dir(bevy_demo_dir).is_ok() && is_valid_cargo_project()
+        let bevy_demo_exists = unsafe {
+            if !CHECKED_BEFORE {
+            BEVY_DEMO_EXISTS = std::path::Path::new(bevy_demo_dir).exists()
+                && is_valid_cargo_project(format!(r"{}\Cargo.toml", bevy_demo_dir));
+            CHECKED_BEFORE = true;
+            }
+            BEVY_DEMO_EXISTS
         };
 
         // 2. If a new command is pending, spawn the process and output thread
-        if let Some(args) = self.pending_cmd.take() {
-            let (tx, rx) = unbounded();
-            self.output_lines.clear();
-            self.output_lines_rx = Some(rx);
-            let child_arc = self.child.clone();
-            let is_bevy_demo = args
-                == vec![
-                    "--follow",
-                    "--grid",
-                    "5x5m1",
-                    "--fit-grid",
-                    "--timeout",
-                    "5",
-                    "--hide-title-bar",
-                    "--flash-topmost",
-                    "--shake-duration",
-                    "50",
-                    "--hide-taskbar",
-                    "--hide-border",
-                    "-rpf",
-                    "-rpc",
-                    "--assign-parent-cell",
-                    "0x2",
-                    "--keep-open",
-                    "cargo-e",
-                    "-f",
-                    "--run-all",
-                    "--run-at-a-time",
-                    "27",
-                ];
-            let current_dir = if is_bevy_demo && bevy_demo_exists {
-                Some(bevy_demo_dir)
-            } else {
-                None
-            };
-            std::thread::spawn({
-                let ctx = ctx.clone();
-                move || {
-                    let mut cmd = Command::new("startt");
-                    cmd.args(&args);
-                    if let Some(dir) = current_dir {
-                        cmd.current_dir(dir);
-                    }
-                    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-                    let mut child = cmd.spawn().expect("Failed to launch startt");
-                    let stdout = child.stdout.take().unwrap();
+        if let Some(pending_cmd) = self.pending_cmd.take() {
+            let args = pending_cmd.args;
+            let current_dir = pending_cmd.dir.clone(); // Clone to own the Option<String>
+
+            if self.detached {
+                let child_arc = self.child.clone();
+                let (tx, rx) = unbounded();
+                self.output_lines.clear();
+                self.output_lines_rx = Some(rx);
+
+                // Clone args and current_dir for the first thread
+                let args_detached = args.clone();
+                let current_dir_detached = current_dir.clone();
+
+                // Spawn the process in a new console window
+                std::thread::spawn(move || {
+                    let current_dir_ref = current_dir_detached.as_deref();
+                    let mut cmd = if cfg!(target_os = "windows") {
+                        let mut command = Command::new("cmd");
+                        command.args(["/C", "start"]);
+                        command.args(&args_detached);
+                        if let Some(dir) = current_dir_ref {
+                            command.current_dir(dir);
+                        }
+                        command
+                    } else {
+                        let mut command = Command::new("x-terminal-emulator"); // For Linux/Unix systems
+                        command.args(["-e"]);
+                        command.args(&args_detached);
+                        if let Some(dir) = current_dir_ref {
+                            command.current_dir(dir);
+                        }
+                        command
+                    };
+                    // Log the current working directory and command line
+                    // Determine the current working directory to use
+                    let cwd = if let Some(dir) = current_dir_ref {
+                        dir.to_string()
+                    } else {
+                        std::env::current_dir()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|_| "Unknown".to_string())
+                    };
+                    let command_line = format!("Detached Mode: Command Line: {:?}", args_detached);
+
+                    // Send the details to the output channel
+                    let _ = tx.send(format!("Detached Mode: Current Working Directory: {}", cwd));
+                    let _ = tx.send(command_line);
+
+                    let child = cmd.spawn().expect("Failed to launch process in detached mode");
                     {
                         let mut child_lock = child_arc.lock().unwrap();
                         *child_lock = Some(child);
                     }
-                    let reader = BufReader::new(stdout);
-                    for line in reader.lines() {
-                        if let Ok(line) = line {
-                            let _ = tx.send(line);
-                            ctx.request_repaint();
-                        }
+                });
+            } else {
+                // Non-detached mode: spawn the process in the same console
+                // Spawn the process and capture output
+                let (tx, rx) = unbounded();
+                self.output_lines.clear();
+                self.output_lines_rx = Some(rx);
+                let child_arc = self.child.clone();
+
+                // Clone args and current_dir for the second thread
+                let args_capture = args.clone();
+                let current_dir_capture = current_dir.clone();
+
+                std::thread::spawn(move || {
+                    let mut cmd = Command::new("startt");
+                    cmd.args(&args_capture);
+                    if let Some(dir) = current_dir_capture {
+                        cmd.current_dir(dir);
                     }
-                }
-            });
+                    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+                    let mut child = cmd.spawn().expect("Failed to launch startt");
+
+                    let mut stdout = child.stdout.take().unwrap();
+                    let mut stderr = child.stderr.take().unwrap();
+                    {
+                        let mut child_lock = child_arc.lock().unwrap();
+                        *child_lock = Some(child);
+                    }
+                    let tx_stdout = tx.clone();
+                    let tx_stderr = tx;
+
+                    let stdout_thread = std::thread::spawn(move || {
+                        let reader = BufReader::new(stdout);
+                        for line in reader.lines() {
+                            if let Ok(line) = line {
+                                let _ = tx_stdout.send(line);
+                            }
+                        }
+                    });
+
+                    let stderr_thread = std::thread::spawn(move || {
+                        let reader = BufReader::new(stderr);
+                        for line in reader.lines() {
+                            if let Ok(line) = line {
+                                let _ = tx_stderr.send(line);
+                            }
+                        }
+                    });
+
+                    // Wait for both threads to finish
+                    let _ = stdout_thread.join();
+                    let _ = stderr_thread.join();
+
+                    // let mut child_lock = child_arc.lock().unwrap();
+                    // *child_lock = Some(child);
+                });
+            }
+                
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading(format!("startt v{}{}", env!("CARGO_PKG_VERSION"), {
-                let (y, m, d) = (
-                    option_env!("BUILD_YEAR"),
-                    option_env!("BUILD_MONTH"),
-                    option_env!("BUILD_DAY"),
-                );
-                if let (Some(y), Some(m), Some(d)) = (y, m, d) {
-                    let build_date = chrono::NaiveDate::from_ymd_opt(
-                        y.parse().unwrap_or(1970),
-                        m.parse().unwrap_or(1),
-                        d.parse().unwrap_or(1),
-                    );
-                    if let Some(build_date) = build_date {
-                        let days_ago = (chrono::Utc::now().date_naive() - build_date).num_days();
-                        format!(" (built {} days ago)", days_ago)
-                    } else {
-                        String::from(" (build date unknown)")
-                    }
-                } else {
-                    String::from(" (build date unknown)")
-                }
-            }));
+            ui.heading(&self.heading);
+
+            // Checkbox to toggle detached mode
+            ui.checkbox(&mut self.detached, "Detached Mode");
+
+            // Command line input and Run/Stop button
             let child_running = self.child.lock().unwrap().is_some();
             ui.label("Command line:");
 
@@ -203,13 +254,16 @@ impl eframe::App for StarttApp {
                             }
                         }
                     } else {
-                        let args: Vec<String> = self
+                        let mut args: Vec<String> = self
                             .cmdline
                             .split_whitespace()
                             .map(|s| s.to_string())
                             .collect();
+                        if !args.is_empty() && args[0] != "startt" {
+                            args.insert(0, "startt".to_string());
+                        }
                         if !args.is_empty() {
-                            self.pending_cmd = Some(args);
+                            self.pending_cmd = Some(PendingCmd { args, dir: None });
                         }
                     }
                 }
@@ -218,7 +272,7 @@ impl eframe::App for StarttApp {
             // Combo box for output mode (keep as before)
             let mut output_mode = self.output_mode.lock().unwrap();
             let mut mode_changed = false;
-            egui::ComboBox::from_label("Output Mode")
+            egui::ComboBox::from_label("")
                 .selected_text(match *output_mode {
                     OutputMode::FollowBottom => "Follow bottom",
                     OutputMode::Reverse => "Reverse",
@@ -290,30 +344,33 @@ impl eframe::App for StarttApp {
                     //         "& pause"
                     //     ].join(" ").into(),
                     // ]);
-                    self.pending_cmd = Some(vec![
-                        "--follow".into(),
-                        "--grid".into(),
-                        "5x5m1".into(),
-                        "--fit-grid".into(),
-                        "--timeout".into(),
-                        "5".into(),
-                        "--hide-title-bar".into(),
-                        "--flash-topmost".into(),
-                        "--shake-duration".into(),
-                        "50".into(),
-                        "--hide-taskbar".into(),
-                        "--hide-border".into(),
-                        "-rpf".into(),
-                        "-rpc".into(),
-                        "--assign-parent-cell".into(),
-                        "0x2".into(),
-                        "--keep-open".into(),
-                        "cargo-e".into(),
-                        "-f".into(),
-                        "--run-all".into(),
-                        "--run-at-a-time".into(),
-                        "27".into(),
-                    ]);
+                    // Specify the Bevy Grid Demo command arguments once
+                    
+                    let bevy_grid_demo_args = vec![
+                        "--follow",
+                        "--grid", "5x7m1",
+                        "--fit-grid",
+                        "--timeout", "5",
+                        "--hide-title-bar",
+                        "--flash-topmost",
+                        "--shake-duration", "50",
+                        "--hide-taskbar",
+                        "--hide-border",
+                        "-rpf",
+                        "-rpc",
+                        "--assign-parent-cell", "0x2",
+                        "--keep-open",
+                        "cargo-e",
+                        "-f",
+                        "--nS",
+                        "--run-all",
+                        "--run-at-a-time", "45",
+                    ];
+                    let args = std::iter::once("startt".to_string())
+                        .chain(bevy_grid_demo_args.iter().map(|s| s.to_string()))
+                        .collect::<Vec<String>>(); 
+                    self.pending_cmd = Some(PendingCmd { args, dir: Some(bevy_demo_dir.to_string()) });
+                    self.cmdline = bevy_grid_demo_args.join(" ");
                 }
             }
 
@@ -381,6 +438,7 @@ impl eframe::App for StarttApp {
                     let (setup_tx, setup_rx) = unbounded();
                     self.output_lines.clear();
                     self.output_lines_rx = Some(setup_rx);
+                    let child_arc = self.child.clone();
                     std::thread::spawn(move || {
                         let setup_cmd = "git clone https://github.com/bevyengine/bevy.git && cd bevy && cargo install cargo-e startt";
                         let mut child = if cfg!(target_os = "windows") {
@@ -399,8 +457,13 @@ impl eframe::App for StarttApp {
                                 .spawn()
                         }
                         .expect("Failed to run setup command");
+                        let mut stdout = child.stdout.take().unwrap();
+                        let mut stderr = child.stderr.take().unwrap();
 
-                        let stdout = child.stdout.take().unwrap();
+                        {
+                            let mut child_lock = child_arc.lock().unwrap();
+                            *child_lock = Some(child);
+                        }
                         let reader = BufReader::new(stdout);
                         for line in reader.lines() {
                             if let Ok(line) = line {
@@ -408,7 +471,6 @@ impl eframe::App for StarttApp {
                             }
                         }
 
-                        let stderr = child.stderr.take().unwrap();
                         let reader = BufReader::new(stderr);
                         for line in reader.lines() {
                             if let Ok(line) = line {
@@ -419,6 +481,11 @@ impl eframe::App for StarttApp {
                 }
             }
         });
+        let mut last_repaint = Instant::now();
+        if last_repaint.elapsed() > Duration::from_millis(100) {
+            ctx.request_repaint();
+            last_repaint = Instant::now();
+        }
     }
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         if let Ok(mut child_lock) = self.child.lock() {
@@ -472,7 +539,7 @@ pub fn fun_name() -> Option<std::result::Result<(), std::io::Error>> {
         Box::new(|_cc| {
             Ok::<Box<dyn eframe::App>, Box<dyn std::error::Error + Send + Sync>>(Box::new(
                 StarttApp {
-                    message: format!("startt v{}{}", env!("CARGO_PKG_VERSION"), {
+                    heading: format!("startt v{}{}", env!("CARGO_PKG_VERSION"), {
                         let (y, m, d) = (
                             option_env!("BUILD_YEAR"),
                             option_env!("BUILD_MONTH"),
@@ -504,6 +571,7 @@ pub fn fun_name() -> Option<std::result::Result<(), std::io::Error>> {
                     last_scroll_interaction: Arc::new(Mutex::new(Some(Instant::now()))),
                     stick_to_bottom: Arc::new(Mutex::new(true)),
                     force_scroll_jump: None,
+                    detached: true,
                 },
             ))
         }),
@@ -574,28 +642,30 @@ pub fn fun_name() -> Option<std::result::Result<(), std::io::Error>> {
 //      }
 // }
 
-pub fn is_valid_cargo_project() -> bool {
+pub fn is_valid_cargo_project(manifest_path: impl AsRef<std::path::Path>) -> bool {
+    let manifest_path = manifest_path.as_ref();
     let output = Command::new("cargo")
         .arg("metadata")
         .arg("--format-version")
         .arg("1")
+        .arg("--manifest-path")
+        .arg(manifest_path)
         .output();
 
     match output {
-        Ok(output) if output.status.success() => {
-            // println!("Valid Cargo project detected.");
-            true
-        }
-        Ok(output) => {
-            // eprintln!(
-            //     "Cargo metadata failed with status: {}",
-            //     output.status
-            // );
-            false
-        }
+        Ok(output) if output.status.success() => true,
+        Ok(_) => false,
         Err(err) => {
             eprintln!("Failed to run cargo metadata: {}", err);
             false
         }
     }
 }
+
+// --- Add this PendingCmd struct ---
+#[derive(Default)]
+pub struct PendingCmd {
+    pub args: Vec<String>,
+    pub dir: Option<String>, // Optional directory
+}
+
