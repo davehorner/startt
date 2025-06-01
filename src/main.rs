@@ -143,7 +143,6 @@ struct GridState {
     monitor_rect: RECT,
     cells: Vec<GridCell>,
     reserved_cell: Option<usize>,
-    // filled_count: usize,
     hwnd_to_cell: DashMap<HWND, usize>,
     parent_cell_idx: Option<usize>,
     parent_hwnd: isize,
@@ -154,6 +153,7 @@ struct GridState {
     retain_launcher_focus: bool,
     has_been_filled_at_some_point: bool,
     fit_grid: bool,
+    failed_hwnds: HashMap<isize, u32>,
 }
 
 impl GridState {
@@ -185,7 +185,7 @@ impl GridState {
 
     /// Move the given HWND to the specified cell index, resizing if fit_grid is true.
     /// Handles console windows with shrinking logic.
-    pub fn move_hwnd_to_cell(&self, hwnd: HWND, cell_idx: usize, fit_grid: bool) -> bool {
+    pub fn move_hwnd_to_cell(&mut self, hwnd: HWND, cell_idx: usize, fit_grid: bool) -> bool {
         use std::thread::sleep;
         use std::time::Duration;
         use winapi::um::winuser::{
@@ -298,6 +298,10 @@ impl GridState {
                 if actual_x == x && actual_y == y {
                     success = true;
                 } else {
+                    self.failed_hwnds
+                        .entry(hwnd as isize)
+                        .and_modify(|count| *count += 1)
+                        .or_insert(1);
                     println!(
                         "Warning: HWND {:?} did not move to expected position (wanted: {},{} got: {},{})",
                         hwnd, x, y, actual_x, actual_y
@@ -803,7 +807,7 @@ impl GridState {
         }
     }
 
-    pub fn set_parent_cell_locked(self, parent_cell_idx: Option<usize>, parent_hwnd: HWND) {
+    pub fn set_parent_cell_locked(mut self, parent_cell_idx: Option<usize>, parent_hwnd: HWND) {
         Self::with(|grid| {
             if let Some(idx) = parent_cell_idx {
                 grid.cells[idx] = GridCell {
@@ -811,7 +815,7 @@ impl GridState {
                     filled_at: Some(Instant::now()),
                 };
                 grid.reserved_cell = Some(idx);
-                self.move_hwnd_to_cell(parent_hwnd, idx, self.fit_grid);
+                grid.move_hwnd_to_cell(parent_hwnd, idx, grid.fit_grid);
                 println!("Reserved parent cell {} for HWND {:?}", idx, parent_hwnd);
             }
         });
@@ -1030,7 +1034,7 @@ impl GridState {
         if unsafe { GetParent(hwnd) } != std::ptr::null_mut() {
             return false;
         }
-        if let Some(fail_count) = failed_hwnds.get(&(hwnd as isize)) {
+        if let Some(fail_count) = self.failed_hwnds.get(&(hwnd as isize)) {
             if *fail_count >= max_hwnd_retries {
                 return false;
             }
@@ -1414,10 +1418,28 @@ impl MyEventHandler {
         Self {}
     }
 }
+use std::os::windows::io::AsRawHandle;
+use winapi::um::consoleapi::SetConsoleMode;
+use winapi::um::wincon::ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+use winapi::um::consoleapi::GetConsoleMode;
+
+fn enable_ansi_support() {
+    use winapi::um::winnt::HANDLE;
+    unsafe {
+        let handle = std::io::stdout().as_raw_handle() as HANDLE;
+        let mut mode = 0;
+        if GetConsoleMode(handle, &mut mode) != 0 {
+            SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+        }
+    }
+}
 
 use std::sync::mpsc::Sender;
 static mut HOOK_SENDER: Option<Sender<usize>> = None;
 fn main() -> windows::core::Result<()> {
+    // Enable ANSI escape sequence support
+    enable_ansi_support();
+
     // Launch egui window on the main thread
     // Only launch egui window if --gui is present in the command line arguments
     if env::args().any(|arg| arg == "--gui") {
@@ -2106,7 +2128,6 @@ fn main() -> windows::core::Result<()> {
                                 (rows * cols) as usize
                             ],
                             reserved_cell,
-                            // filled_count: 0,
                             hwnd_to_cell: DashMap::new(),
                             parent_cell_idx: reserved_cell,
                             parent_hwnd: phwnd,
@@ -2120,6 +2141,7 @@ fn main() -> windows::core::Result<()> {
                             },
                             has_been_filled_at_some_point: false,
                             fit_grid: fit_grid,
+                            failed_hwnds: HashMap::new(), // Initialize as empty
                         };
                         // Store the grid state in the global Arc<Mutex<Option<GridState>>>
                         *grid_state_arc.lock().unwrap() = Some(g);
@@ -2445,7 +2467,7 @@ fn main() -> windows::core::Result<()> {
                                         new_y,
                                         0,
                                         0,
-                                        SWP_NOSIZE | SWP_NOZORDER,
+                    SWP_NOSIZE | SWP_NOZORDER,
                                     );
                                 }
                                 // After moving, verify the window is at the expected position
