@@ -572,6 +572,18 @@ impl GridState {
         if let Some(&existing_idx) = self.hwnd_to_cell.get(&hwnd).as_deref() {
             return Some(existing_idx);
         }
+
+        // Don't process a window that has failed too many times
+        if let Some(fail_count) = self.failed_hwnds.get(&(hwnd as isize)) {
+            if *fail_count >= 3 {
+                eprintln!(
+                    "Skipping HWND {:?} because it failed {} times (max retries reached)",
+                    hwnd, fail_count
+                );
+                return None;
+            }
+        }
+
         // Find the first available cell (empty or timed out), and check time/pixel constraints before moving
         let total_cells = self.cells.len();
         let mut selected_cell = None;
@@ -792,6 +804,8 @@ impl GridState {
                 };
                 self.hwnd_to_cell.insert(hwnd, cell_idx);
             }
+
+            self.do_the_things(hwnd);
             // if self.has_been_filled_at_some_point() {
             //     if let Some(timeout) = timeout_secs {
             //         self.cells[cell_idx].start_eviction_timer(cell_idx, timeout);
@@ -803,11 +817,47 @@ impl GridState {
                 "Warning: HWND {:?} did not move to expected position (wanted: {},{}).",
                 hwnd, new_x, new_y
             );
+            self.failed_hwnds
+                .entry(hwnd as isize)
+                .and_modify(|count| *count += 1)
+                .or_insert(1);
+
             None
         }
     }
 
-    pub fn set_parent_cell_locked(mut self, parent_cell_idx: Option<usize>, parent_hwnd: HWND) {
+    pub fn do_the_things(&self, hwnd: HWND) {
+        let options = startt::cli::get_command_line_options();
+        if options.should_hide_border {
+            println!("Hiding border for HWND {:?}", hwnd);
+            unsafe { hide_window_border(hwnd) };
+        }
+        if options.should_hide_title_bar {
+            println!("Hiding title bar for HWND {:?}", hwnd);
+            unsafe { hide_window_title_bar(hwnd) };
+        }
+        if options.flash_topmost_ms > 0 {
+            println!(
+                "Flashing HWND {:?} as topmost for {} ms...",
+                hwnd, options.flash_topmost_ms
+            );
+            unsafe { flash_topmost(hwnd, options.flash_topmost_ms) };
+        }
+        // Shake the window in a non-blocking way (spawn a thread)
+        let hwnd_copy = hwnd as isize;
+        // Spawn the shake thread and collect the JoinHandle
+        let shake_handle = std::thread::spawn(move || {
+            println!(
+                "Shaking HWND {:?} for {} ms...",
+                hwnd_copy, options.shake_duration
+            );
+            let hwnd = hwnd_copy as HWND;
+            unsafe { startt::hwnd::shake_window(hwnd, 10, options.shake_duration) };
+        });
+        add_shake_handle(shake_handle);
+    }
+
+    pub fn set_parent_cell_locked(self, parent_cell_idx: Option<usize>, parent_hwnd: HWND) {
         Self::with(|grid| {
             if let Some(idx) = parent_cell_idx {
                 grid.cells[idx] = GridCell {
@@ -1419,9 +1469,9 @@ impl MyEventHandler {
     }
 }
 use std::os::windows::io::AsRawHandle;
+use winapi::um::consoleapi::GetConsoleMode;
 use winapi::um::consoleapi::SetConsoleMode;
 use winapi::um::wincon::ENABLE_VIRTUAL_TERMINAL_PROCESSING;
-use winapi::um::consoleapi::GetConsoleMode;
 
 fn enable_ansi_support() {
     use winapi::um::winnt::HANDLE;
@@ -1439,7 +1489,7 @@ static mut HOOK_SENDER: Option<Sender<usize>> = None;
 fn main() -> windows::core::Result<()> {
     // Enable ANSI escape sequence support
     enable_ansi_support();
-
+    startt::cli::parse_command_line();
     // Launch egui window on the main thread
     // Only launch egui window if --gui is present in the command line arguments
     if env::args().any(|arg| arg == "--gui") {
@@ -1654,6 +1704,7 @@ fn main() -> windows::core::Result<()> {
         } else if arg_str == "-hB" || arg_str == "--hide-border" {
             should_hide_border = true;
         } else if arg_str == "--shake-duration" || arg_str == "-sd" {
+            println!("Setting shake duration");
             let dur_arg = args
                 .next()
                 .expect("Expected milliseconds after --shake-duration/-sd");
@@ -1661,6 +1712,7 @@ fn main() -> windows::core::Result<()> {
                 .to_string_lossy()
                 .parse()
                 .expect("Invalid shake duration value");
+            println!("Shake duration set to {} ms", shake_duration);
         } else if arg_str == "--fit-grid" || arg_str == "-fg" {
             fit_grid = true;
         } else if arg_str == "--reserve-parent-cell" || arg_str == "-rpc" {
@@ -1811,7 +1863,7 @@ fn main() -> windows::core::Result<()> {
     };
 
     // Prepare to collect shake thread handles
-    let mut shake_handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
+    // let mut shake_handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
 
     // Launch the process
     let mut sei = winapi::um::shellapi::SHELLEXECUTEINFOW {
@@ -2467,7 +2519,7 @@ fn main() -> windows::core::Result<()> {
                                         new_y,
                                         0,
                                         0,
-                    SWP_NOSIZE | SWP_NOZORDER,
+                                        SWP_NOSIZE | SWP_NOZORDER,
                                     );
                                 }
                                 // After moving, verify the window is at the expected position
@@ -2512,12 +2564,11 @@ fn main() -> windows::core::Result<()> {
                 }
                 // Shake the window in a non-blocking way (spawn a thread)
                 let hwnd_copy = hwnd as isize;
-                // Spawn the shake thread and collect the JoinHandle
                 let shake_handle = std::thread::spawn(move || {
                     let hwnd = hwnd_copy as HWND;
                     startt::hwnd::shake_window(hwnd, 10, shake_duration);
                 });
-                shake_handles.push(shake_handle);
+                add_shake_handle(shake_handle);
 
                 if was_minimized {
                     println!("Re-minimizing window: {:?}", hwnd);
@@ -2556,7 +2607,7 @@ fn main() -> windows::core::Result<()> {
                     let hwnd = hwnd_copy as HWND;
                     startt::hwnd::shake_window(hwnd, 10, shake_duration);
                 });
-                shake_handles.push(shake_handle);
+                add_shake_handle(shake_handle);
                 {
                     let mut phwnd = parent_hwnd.lock().unwrap();
                     *phwnd = Some(hwnd as isize);
@@ -2929,15 +2980,7 @@ fn main() -> windows::core::Result<()> {
             }
         }
 
-        if !shake_handles.is_empty() {
-            println!(
-                "Waiting for {} shake handles to finish...",
-                shake_handles.len()
-            );
-            for handle in shake_handles {
-                let _ = handle.join();
-            }
-        }
+        wait_for_shake_handles();
         println!("Finished processing windows.");
         Ok(())
     }
@@ -3150,3 +3193,17 @@ pub fn install_window_destroy_hook(
 //         }
 //     }
 // }
+use once_cell::sync::Lazy;
+static SHAKE_HANDLES: Lazy<Mutex<Vec<std::thread::JoinHandle<()>>>> =
+    Lazy::new(|| Mutex::new(Vec::new()));
+
+fn add_shake_handle(handle: std::thread::JoinHandle<()>) {
+    SHAKE_HANDLES.lock().unwrap().push(handle);
+}
+
+fn wait_for_shake_handles() {
+    let mut handles = SHAKE_HANDLES.lock().unwrap();
+    while let Some(handle) = handles.pop() {
+        let _ = handle.join();
+    }
+}

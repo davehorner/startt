@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.16](https://github.com/davehorner/startt/compare/v0.1.15...v0.1.16) - 2025-06-01
+
+### Fixed
+
+- respect shake, border, and title options.
+
 ## [0.1.15](https://github.com/davehorner/startt/compare/v0.1.14...v0.1.15) - 2025-06-01
 
 ### Added
