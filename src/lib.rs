@@ -9,6 +9,7 @@ use winapi::um::psapi::GetProcessImageFileNameW;
 use winapi::um::winnt::{HANDLE, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
 use winapi::um::winuser::{EnumWindows, GetWindowThreadProcessId};
 
+pub mod cli;
 pub mod gui;
 pub mod hwnd;
 // Example usage: find the oldest matching GUI app(s)

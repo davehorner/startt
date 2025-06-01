@@ -86,15 +86,15 @@ impl eframe::App for StarttApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Drain output lines from the channel (lock free)
         // if !self.detached {
-            if let Some(rx) = &self.output_lines_rx {
-                while let Ok(line) = rx.try_recv() {
-                    self.output_lines.push(line);
-                    if self.output_lines.len() > MAX_OUTPUT_LINES {
-                        let excess = self.output_lines.len() - MAX_OUTPUT_LINES;
-                        self.output_lines.drain(0..excess);
-                    }
+        if let Some(rx) = &self.output_lines_rx {
+            while let Ok(line) = rx.try_recv() {
+                self.output_lines.push(line);
+                if self.output_lines.len() > MAX_OUTPUT_LINES {
+                    let excess = self.output_lines.len() - MAX_OUTPUT_LINES;
+                    self.output_lines.drain(0..excess);
                 }
             }
+        }
         // }
 
         // Only check for Bevy demo existence on first launch
@@ -103,9 +103,9 @@ impl eframe::App for StarttApp {
         let bevy_demo_dir = r"C:\w\demos\bevy";
         let bevy_demo_exists = unsafe {
             if !CHECKED_BEFORE {
-            BEVY_DEMO_EXISTS = std::path::Path::new(bevy_demo_dir).exists()
-                && is_valid_cargo_project(format!(r"{}\Cargo.toml", bevy_demo_dir));
-            CHECKED_BEFORE = true;
+                BEVY_DEMO_EXISTS = std::path::Path::new(bevy_demo_dir).exists()
+                    && is_valid_cargo_project(format!(r"{}\Cargo.toml", bevy_demo_dir));
+                CHECKED_BEFORE = true;
             }
             BEVY_DEMO_EXISTS
         };
@@ -160,7 +160,9 @@ impl eframe::App for StarttApp {
                     let _ = tx.send(format!("Detached Mode: Current Working Directory: {}", cwd));
                     let _ = tx.send(command_line);
 
-                    let child = cmd.spawn().expect("Failed to launch process in detached mode");
+                    let child = cmd
+                        .spawn()
+                        .expect("Failed to launch process in detached mode");
                     {
                         let mut child_lock = child_arc.lock().unwrap();
                         *child_lock = Some(child);
@@ -187,8 +189,8 @@ impl eframe::App for StarttApp {
                     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
                     let mut child = cmd.spawn().expect("Failed to launch startt");
 
-                    let mut stdout = child.stdout.take().unwrap();
-                    let mut stderr = child.stderr.take().unwrap();
+                    let stdout = child.stdout.take().unwrap();
+                    let stderr = child.stderr.take().unwrap();
                     {
                         let mut child_lock = child_arc.lock().unwrap();
                         *child_lock = Some(child);
@@ -222,7 +224,6 @@ impl eframe::App for StarttApp {
                     // *child_lock = Some(child);
                 });
             }
-                
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -364,7 +365,7 @@ impl eframe::App for StarttApp {
                         "-f",
                         "--nS",
                         "--run-all",
-                        "--run-at-a-time", "45",
+                        "--run-at-a-time", "35",
                     ];
                     let args = std::iter::once("startt".to_string())
                         .chain(bevy_grid_demo_args.iter().map(|s| s.to_string()))
@@ -457,8 +458,8 @@ impl eframe::App for StarttApp {
                                 .spawn()
                         }
                         .expect("Failed to run setup command");
-                        let mut stdout = child.stdout.take().unwrap();
-                        let mut stderr = child.stderr.take().unwrap();
+                        let stdout = child.stdout.take().unwrap();
+                        let stderr = child.stderr.take().unwrap();
 
                         {
                             let mut child_lock = child_arc.lock().unwrap();
@@ -668,4 +669,3 @@ pub struct PendingCmd {
     pub args: Vec<String>,
     pub dir: Option<String>, // Optional directory
 }
-

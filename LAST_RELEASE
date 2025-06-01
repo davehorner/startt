@@ -1,6 +1,6 @@
-﻿25/06/01|d07ebe1|0.1.15 0.61.1
-## [0.1.15](https://github.com/davehorner/startt/compare/v0.1.14...v0.1.15) - 2025-06-01
+﻿25/06/01|842ef57|0.1.16 0.61.1
+## [0.1.16](https://github.com/davehorner/startt/compare/v0.1.15...v0.1.16) - 2025-06-01
 
-### Added
+### Fixed
 
-- ANSI codes enabled. detached mode in gui. update failed_hwnds.
+- respect shake, border, and title options.
