@@ -1,5 +1,7 @@
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
+use once_cell::sync::OnceCell;
 use winapi::shared::minwindef::{DWORD, FILETIME};
 use winapi::shared::windef::HWND;
 use winapi::um::handleapi::CloseHandle;
@@ -12,6 +14,31 @@ use winapi::um::winuser::{EnumWindows, GetWindowThreadProcessId};
 pub mod cli;
 pub mod gui;
 pub mod hwnd;
+
+static INITIAL_HWND_SET: OnceCell<HashSet<isize>> = OnceCell::new();
+
+pub fn snapshot_initial_hwnds() {
+    let mut hwnd_set = HashSet::new();
+    unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: winapi::shared::minwindef::LPARAM) -> i32 {
+        let set = &mut *(lparam as *mut HashSet<isize>);
+        set.insert(hwnd as isize);
+        1
+    }
+    unsafe {
+        EnumWindows(Some(enum_proc), &mut hwnd_set as *mut _ as winapi::shared::minwindef::LPARAM);
+    }
+    INITIAL_HWND_SET.set(hwnd_set).ok();
+}
+
+
+pub fn is_hwnd_new(hwnd: HWND) -> bool {
+    if let Some(hwnd_set) = INITIAL_HWND_SET.get() {
+        !hwnd_set.contains(&(hwnd as isize))
+    } else {
+        false
+    }
+}
+
 // Example usage: find the oldest matching GUI app(s)
 // Usage: find_oldest_recent_apps(&file.to_string_lossy(), 1)
 // Returns the oldest (least recent) matching app(s)
@@ -32,6 +59,11 @@ pub fn find_oldest_recent_apps(
 
         extern "system" fn enum_windows_proc(hwnd: HWND, lparam: isize) -> i32 {
             let data = unsafe { &mut *(lparam as *mut EnumData) };
+
+            if !is_hwnd_new(hwnd) {
+                // Skip if hwnd existed at program start
+                return 1; // Continue enumeration
+            }
 
             // Check if the window has the WS_VISIBLE style
             let style = unsafe {
@@ -335,6 +367,10 @@ pub fn find_most_recent_gui_apps(
         extern "system" fn enum_windows_proc(hwnd: HWND, lparam: isize) -> i32 {
             let data = unsafe { &mut *(lparam as *mut EnumData) };
 
+            if !is_hwnd_new(hwnd) {
+                // Skip if hwnd existed at program start
+                return 1; // Continue enumeration
+            }
             // println!("Enumerating HWND: {:?}", hwnd);
 
             // // Check if the window is visible

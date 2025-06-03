@@ -1055,6 +1055,10 @@ impl GridState {
         if hwnd.is_null() {
             return false;
         }
+        if !startt::is_hwnd_new(hwnd) {
+            // If the window existed before our shellexec, skip it
+            return false;
+        }
         // Class name filtering
         let mut class_name = [0u16; 256];
         let class_name_len =
@@ -1862,8 +1866,7 @@ fn main() -> windows::core::Result<()> {
         })?)
     };
 
-    // Prepare to collect shake thread handles
-    // let mut shake_handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
+    startt::snapshot_initial_hwnds();
 
     // Launch the process
     let mut sei = winapi::um::shellapi::SHELLEXECUTEINFOW {
@@ -2586,31 +2589,33 @@ fn main() -> windows::core::Result<()> {
             // Find the HWND using the real PID
             if let Some(hwnd) = startt::hwnd::find_hwnd_by_pid(parent_pid) {
                 println!("Found HWND = {:?}", hwnd);
-                if should_hide_border {
-                    println!("Hiding border for HWND {:?}", hwnd);
-                    startt::hwnd::hide_window_border(hwnd);
-                }
-                if should_hide_title_bar {
-                    println!("Hiding title bar for HWND {:?}", hwnd);
-                    startt::hwnd::hide_window_title_bar(hwnd);
-                }
-                if flash_topmost_ms > 0 {
-                    println!(
-                        "Flashing HWND {:?} as topmost for {} ms...",
-                        hwnd, flash_topmost_ms
-                    );
-                    startt::hwnd::flash_topmost(hwnd, flash_topmost_ms);
-                }
-                // Shake the window in a non-blocking way (spawn a thread)
-                let hwnd_copy = hwnd as isize;
-                let shake_handle = std::thread::spawn(move || {
-                    let hwnd = hwnd_copy as HWND;
-                    startt::hwnd::shake_window(hwnd, 10, shake_duration);
-                });
-                add_shake_handle(shake_handle);
-                {
-                    let mut phwnd = parent_hwnd.lock().unwrap();
-                    *phwnd = Some(hwnd as isize);
+                if startt::is_hwnd_new(hwnd) {
+                    if should_hide_border {
+                        println!("Hiding border for HWND {:?}", hwnd);
+                        startt::hwnd::hide_window_border(hwnd);
+                    }
+                    if should_hide_title_bar {
+                        println!("Hiding title bar for HWND {:?}", hwnd);
+                        startt::hwnd::hide_window_title_bar(hwnd);
+                    }
+                    if flash_topmost_ms > 0 {
+                        println!(
+                            "Flashing HWND {:?} as topmost for {} ms...",
+                            hwnd, flash_topmost_ms
+                        );
+                        startt::hwnd::flash_topmost(hwnd, flash_topmost_ms);
+                    }
+                    // Shake the window in a non-blocking way (spawn a thread)
+                    let hwnd_copy = hwnd as isize;
+                    let shake_handle = std::thread::spawn(move || {
+                        let hwnd = hwnd_copy as HWND;
+                        startt::hwnd::shake_window(hwnd, 10, shake_duration);
+                    });
+                    add_shake_handle(shake_handle);
+                    {
+                        let mut phwnd = parent_hwnd.lock().unwrap();
+                        *phwnd = Some(hwnd as isize);
+                    }
                 }
             } else {
                 eprintln!("Failed to find HWND for PID {}", parent_pid);
@@ -2707,10 +2712,12 @@ fn main() -> windows::core::Result<()> {
             extern "system" fn enum_windows_proc(hwnd: HWND, lparam: isize) -> i32 {
                 let (child_pids_ptr, hwnd_pid_map_ptr) =
                     unsafe { &mut *(lparam as *mut (&HashSet<u32>, &mut HashMap<HWND, u32>)) };
-                let mut process_id = 0;
-                unsafe { GetWindowThreadProcessId(hwnd, &mut process_id) };
-                if child_pids_ptr.contains(&process_id) {
-                    hwnd_pid_map_ptr.insert(hwnd, process_id);
+                if startt::is_hwnd_new(hwnd) {
+                    let mut process_id = 0;
+                    unsafe { GetWindowThreadProcessId(hwnd, &mut process_id) };
+                    if child_pids_ptr.contains(&process_id) {
+                        hwnd_pid_map_ptr.insert(hwnd, process_id);
+                    }
                 }
                 1
             }
