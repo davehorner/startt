@@ -1,6 +1,6 @@
 [package]
 name = "startt"
-version = "0.1.16"
+version = "0.1.17"
 edition = "2024"
 authors = ["David Horner"]
 description = "Automate detection of HWND and real PID for apps launched through ShellExecuteEx (cmd start, Explorer, PowerShell)"

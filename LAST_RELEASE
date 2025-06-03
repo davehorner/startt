@@ -1,6 +1,7 @@
-﻿25/06/01|842ef57|0.1.16 0.61.1
-## [0.1.16](https://github.com/davehorner/startt/compare/v0.1.15...v0.1.16) - 2025-06-01
+﻿25/06/03|ffc4e33|0.1.17 0.61.1
+## [0.1.17](https://github.com/davehorner/startt/compare/v0.1.16...v0.1.17) - 2025-06-03
 
-### Fixed
+### Added
 
-- respect shake, border, and title options.
+- add initial HWND tracking and filtering for new windows in the application
+- add --version flag to CLI
