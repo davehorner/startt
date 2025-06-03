@@ -82,6 +82,20 @@ pub static CMD_OPTIONS: Lazy<Mutex<CommandLineOptions>> =
 pub fn get_command_line_options() -> CommandLineOptions {
     CMD_OPTIONS.lock().unwrap().clone()
 }
+
+/// Prints the program name and version, then exits.
+fn print_version_and_exit() -> ! {
+    let exe = env::args().next().unwrap_or_else(|| "startt".to_string());
+    let exe = exe
+        .rsplit_once(std::path::MAIN_SEPARATOR)
+        .map(|(_, file)| file)
+        .unwrap_or(&exe)
+        .split('.')
+        .next()
+        .unwrap_or(&exe);
+    println!("{} {}", exe, env!("CARGO_PKG_VERSION"));
+    std::process::exit(0);
+}
 pub fn parse_command_line() {
     let mut args = env::args_os().skip(1).peekable();
     let mut options = CMD_OPTIONS.lock().unwrap();
@@ -90,6 +104,7 @@ pub fn parse_command_line() {
         let arg_str = arg.to_string_lossy();
 
         match arg_str.as_ref() {
+            "--version" => print_version_and_exit(),
             "-f" | "--follow" => options.follow_children = true,
             "-F" | "--follow-forever" => {
                 options.follow_children = true;

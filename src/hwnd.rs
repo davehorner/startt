@@ -351,6 +351,10 @@ pub fn find_hwnd_by_pid(pid: u32) -> Option<HWND> {
 }
 
 pub unsafe fn shake_window(hwnd: HWND, intensity: i32, duration_ms: u64) {
+    if duration_ms == 0 {
+        return;
+    }
+
     unsafe {
         // Bring the window to the front
         winapi::um::winuser::SetForegroundWindow(hwnd);
@@ -367,6 +371,10 @@ pub unsafe fn shake_window(hwnd: HWND, intensity: i32, duration_ms: u64) {
 
         let mut elapsed = 0;
         let step_duration = 50; // Shake step duration in milliseconds
+
+        if duration_ms < step_duration {
+            return;
+        }
 
         while elapsed < duration_ms {
             // Move the window left
@@ -424,7 +432,7 @@ pub unsafe fn shake_window(hwnd: HWND, intensity: i32, duration_ms: u64) {
 
         // Restore the original position
         SetWindowPos(
-            hwnd,
+            hwnd as HWND,
             std::ptr::null_mut(),
             original_x,
             original_y,
