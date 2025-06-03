@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.17](https://github.com/davehorner/startt/compare/v0.1.16...v0.1.17) - 2025-06-03
+
+### Added
+
+- add initial HWND tracking and filtering for new windows in the application
+- add --version flag to CLI
+
 ## [0.1.16](https://github.com/davehorner/startt/compare/v0.1.15...v0.1.16) - 2025-06-01
 
 ### Fixed
