@@ -10,7 +10,7 @@ use ferrisetw::{EventRecord, SchemaLocator};
 use std::ptr;
 use std::sync::{Arc, Mutex};
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use widestring::U16CString;
 use winapi::shared::minwindef::FALSE;
 use winapi::shared::windef::HWND;
@@ -34,32 +34,29 @@ use winapi::um::winuser::{
 use winapi::um::winuser::{EnumWindows, GetWindowThreadProcessId};
 
 pub unsafe fn flash_topmost(hwnd: HWND, duration_ms: u64) {
-    use winapi::um::winuser::{
-        HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetWindowPos,
-    };
     unsafe {
-        // Set topmost
-        SetWindowPos(
-            hwnd,
-            HWND_TOPMOST,
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
-        );
-        // Wait for the duration
-        std::thread::sleep(std::time::Duration::from_millis(duration_ms));
-        // Restore to not topmost
-        SetWindowPos(
-            hwnd,
-            HWND_NOTOPMOST,
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
-        );
+        let start = Instant::now();
+        while start.elapsed().as_millis() < duration_ms as u128 {
+            SetWindowPos(
+                hwnd,
+                winapi::um::winuser::HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                winapi::um::winuser::SWP_NOMOVE | winapi::um::winuser::SWP_NOSIZE,
+            );
+            std::thread::sleep(Duration::from_millis(duration_ms));
+            SetWindowPos(
+                hwnd,
+                winapi::um::winuser::HWND_NOTOPMOST,
+                0,
+                0,
+                0,
+                0,
+                winapi::um::winuser::SWP_NOMOVE | winapi::um::winuser::SWP_NOSIZE,
+            );
+        }
     }
 }
 

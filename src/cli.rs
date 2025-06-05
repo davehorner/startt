@@ -134,6 +134,7 @@ pub fn parse_command_line() {
                     options.flash_topmost_ms = 10; // default
                 }
             }
+            "-hT" | "--hide-title-bar" => options.should_hide_title_bar = true,
             "-hB" | "--hide-border" => options.should_hide_border = true,
             "--shake-duration" | "-sd" => {
                 if let Some(duration_arg) = args.peek() {
