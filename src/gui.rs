@@ -346,7 +346,7 @@ impl eframe::App for StarttApp {
                     //     ].join(" ").into(),
                     // ]);
                     // Specify the Bevy Grid Demo command arguments once
-                    
+
                     let bevy_grid_demo_args = vec![
                         "--follow",
                         "--grid", "5x7m1",
@@ -369,7 +369,7 @@ impl eframe::App for StarttApp {
                     ];
                     let args = std::iter::once("startt".to_string())
                         .chain(bevy_grid_demo_args.iter().map(|s| s.to_string()))
-                        .collect::<Vec<String>>(); 
+                        .collect::<Vec<String>>();
                     self.pending_cmd = Some(PendingCmd { args, dir: Some(bevy_demo_dir.to_string()) });
                     self.cmdline = bevy_grid_demo_args.join(" ");
                 }

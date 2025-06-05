@@ -147,7 +147,6 @@ struct GridState {
     parent_cell_idx: Option<usize>,
     parent_hwnd: isize,
     launcher_pid: u32,
-    launcher_hwnd: isize,
     desktop_hwnd: isize,
     retain_parent_focus: bool,
     retain_launcher_focus: bool,
@@ -226,7 +225,7 @@ impl GridState {
                 unsafe {
                     ShowWindow(hwnd, SW_RESTORE);
                 }
-                sleep(Duration::from_millis(500));
+                // sleep(Duration::from_millis(500));
             }
         }
 
@@ -636,6 +635,13 @@ impl GridState {
                 let min_y = self.monitor_rect.top;
                 let max_x = self.monitor_rect.right - win_width;
                 let max_y = self.monitor_rect.bottom - win_height;
+                if min_x > max_x || min_y > max_y {
+                    eprintln!(
+                        "Invalid clamp range: min_x={}, max_x={}, min_y={}, max_y={}",
+                        min_x, max_x, min_y, max_y
+                    );
+                    return None; // or handle the error appropriately
+                }
                 cx = cx.clamp(min_x, max_x);
                 cy = cy.clamp(min_y, max_y);
                 (cx, cy)
@@ -754,35 +760,35 @@ impl GridState {
         if retain_launcher_focus {
             // Set focus back to the launcher window (parent's parent)
             // Use the stored launcher_hwnd if available, otherwise fallback to GetConsoleWindow
-            if self.launcher_hwnd != 0 {
-                let launcher_hwnd = self.launcher_hwnd as HWND;
-                if !launcher_hwnd.is_null() {
-                    println!(
-                        "DEBUG: Retaining launcher focus after window move (launcher_hwnd={:?})",
-                        launcher_hwnd
-                    );
-                    unsafe {
-                        winapi::um::winuser::SetForegroundWindow(launcher_hwnd);
-                    }
-                } else {
-                    println!("DEBUG: launcher_hwnd is set but null, skipping SetForegroundWindow");
-                }
-            } else {
-                let launcher_hwnd = unsafe { winapi::um::wincon::GetConsoleWindow() };
-                if !launcher_hwnd.is_null() {
-                    println!(
-                        "DEBUG: Retaining launcher focus using console window (launcher_hwnd={:?})",
-                        launcher_hwnd
-                    );
-                    unsafe {
-                        winapi::um::winuser::SetForegroundWindow(launcher_hwnd);
-                    }
-                } else {
-                    println!(
-                        "DEBUG: launcher_hwnd is zero and console window is null, cannot set focus"
-                    );
-                }
-            }
+            // if self.launcher_hwnd != 0 {
+            //     let launcher_hwnd = self.launcher_hwnd as HWND;
+            //     if !launcher_hwnd.is_null() {
+            //         println!(
+            //             "DEBUG: Retaining launcher focus after window move (launcher_hwnd={:?})",
+            //             launcher_hwnd
+            //         );
+            //         unsafe {
+            //             winapi::um::winuser::SetForegroundWindow(launcher_hwnd);
+            //         }
+            //     } else {
+            //         println!("DEBUG: launcher_hwnd is set but null, skipping SetForegroundWindow");
+            //     }
+            // } else {
+            //     let launcher_hwnd = unsafe { winapi::um::wincon::GetConsoleWindow() };
+            //     if !launcher_hwnd.is_null() {
+            //         println!(
+            //             "DEBUG: Retaining launcher focus using console window (launcher_hwnd={:?})",
+            //             launcher_hwnd
+            //         );
+            //         unsafe {
+            //             winapi::um::winuser::SetForegroundWindow(launcher_hwnd);
+            //         }
+            //     } else {
+            //         println!(
+            //             "DEBUG: launcher_hwnd is zero and console window is null, cannot set focus"
+            //         );
+            //     }
+            // }
         }
         // After moving, verify the window is at the expected position
         let mut rect = unsafe { std::mem::zeroed() };
@@ -1229,11 +1235,8 @@ impl GridState {
                 let is_parent = hwnd
                     .map(|h| h as isize == self.parent_hwnd)
                     .unwrap_or(false);
-                let is_launcher = hwnd
-                    .map(|h| h as isize == self.launcher_hwnd)
-                    .unwrap_or(false);
                 let is_reserved = Some(idx) == self.reserved_cell;
-                if is_parent || is_launcher || is_reserved {
+                if is_parent || is_reserved {
                     continue;
                 }
                 if filled_at < oldest_time {
@@ -1341,6 +1344,13 @@ impl GridState {
             let min_y = self.monitor_rect.top;
             let max_x = self.monitor_rect.right - win_width;
             let max_y = self.monitor_rect.bottom - win_height;
+            if min_x > max_x || min_y > max_y {
+                eprintln!(
+                    "Invalid clamp range: min_x={}, max_x={}, min_y={}, max_y={}",
+                    min_x, max_x, min_y, max_y
+                );
+                return None; // or handle the error appropriately
+            }
             cx = cx.clamp(min_x, max_x);
             cy = cy.clamp(min_y, max_y);
             Some((cell, cx, cy))
@@ -2168,6 +2178,7 @@ fn main() -> windows::core::Result<()> {
                                 parent_pid = pid;
                             }
                         }
+                        println!("Parent PID after check: {}", parent_pid);
 
                         let g = GridState {
                             rows,
@@ -2187,8 +2198,6 @@ fn main() -> windows::core::Result<()> {
                             parent_cell_idx: reserved_cell,
                             parent_hwnd: phwnd,
                             launcher_pid: launching_pid,
-                            launcher_hwnd: startt::hwnd::find_hwnd_by_pid(launching_pid)
-                                .map_or(0, |hwnd| hwnd as isize),
                             retain_parent_focus,
                             retain_launcher_focus,
                             desktop_hwnd: unsafe {
@@ -2198,9 +2207,10 @@ fn main() -> windows::core::Result<()> {
                             fit_grid: fit_grid,
                             failed_hwnds: HashMap::new(), // Initialize as empty
                         };
+                        println!("Created new GridState:");
                         // Store the grid state in the global Arc<Mutex<Option<GridState>>>
                         *grid_state_arc.lock().unwrap() = Some(g);
-
+                        println!("GridState initialized and stored in global state.");
                         // Now you can safely call with/set_parent_cell
                         GridState::with(|g| {
                             // g.ensure_clean_desktop();
@@ -2590,6 +2600,11 @@ fn main() -> windows::core::Result<()> {
             if let Some(hwnd) = startt::hwnd::find_hwnd_by_pid(parent_pid) {
                 println!("Found HWND = {:?}", hwnd);
                 if startt::is_hwnd_new(hwnd) {
+                    {
+                        println!("New HWND found: {:?}", hwnd);
+                        let mut phwnd = parent_hwnd.lock().unwrap();
+                        *phwnd = Some(hwnd as isize);
+                    }
                     if should_hide_border {
                         println!("Hiding border for HWND {:?}", hwnd);
                         startt::hwnd::hide_window_border(hwnd);
@@ -2612,10 +2627,6 @@ fn main() -> windows::core::Result<()> {
                         startt::hwnd::shake_window(hwnd, 10, shake_duration);
                     });
                     add_shake_handle(shake_handle);
-                    {
-                        let mut phwnd = parent_hwnd.lock().unwrap();
-                        *phwnd = Some(hwnd as isize);
-                    }
                 }
             } else {
                 eprintln!("Failed to find HWND for PID {}", parent_pid);
