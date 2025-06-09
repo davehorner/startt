@@ -10,7 +10,7 @@ use ferrisetw::{EventRecord, SchemaLocator};
 use std::ptr;
 use std::sync::{Arc, Mutex};
 use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use widestring::U16CString;
 use winapi::shared::minwindef::FALSE;
 use winapi::shared::windef::HWND;
@@ -33,32 +33,32 @@ use winapi::um::winuser::{
 };
 use winapi::um::winuser::{EnumWindows, GetWindowThreadProcessId};
 
-pub unsafe fn flash_topmost(hwnd: HWND, duration_ms: u64) {
-    unsafe {
-        let start = Instant::now();
-        while start.elapsed().as_millis() < duration_ms as u128 {
-            SetWindowPos(
-                hwnd,
-                winapi::um::winuser::HWND_TOPMOST,
-                0,
-                0,
-                0,
-                0,
-                winapi::um::winuser::SWP_NOMOVE | winapi::um::winuser::SWP_NOSIZE,
-            );
-            std::thread::sleep(Duration::from_millis(duration_ms));
-            SetWindowPos(
-                hwnd,
-                winapi::um::winuser::HWND_NOTOPMOST,
-                0,
-                0,
-                0,
-                0,
-                winapi::um::winuser::SWP_NOMOVE | winapi::um::winuser::SWP_NOSIZE,
-            );
-        }
+pub unsafe fn flash_topmost(hwnd: HWND, duration_ms: u64) { unsafe {
+    if duration_ms == 0 {
+        return;
     }
-}
+    // Set window as topmost
+    SetWindowPos(
+        hwnd,
+        winapi::um::winuser::HWND_TOPMOST,
+        0,
+        0,
+        0,
+        0,
+        winapi::um::winuser::SWP_NOMOVE | winapi::um::winuser::SWP_NOSIZE,
+    );
+    std::thread::sleep(Duration::from_millis(duration_ms));
+    // Restore window to not topmost
+    SetWindowPos(
+        hwnd,
+        winapi::um::winuser::HWND_NOTOPMOST,
+        0,
+        0,
+        0,
+        0,
+        winapi::um::winuser::SWP_NOMOVE | winapi::um::winuser::SWP_NOSIZE,
+    );
+}}
 
 pub unsafe fn hide_window_title_bar(hwnd: HWND) {
     use winapi::um::winuser::{
@@ -308,6 +308,19 @@ pub fn find_hwnd_by_pid(pid: u32) -> Option<HWND> {
         let mut process_id = 0;
         unsafe {
             GetWindowThreadProcessId(hwnd, &mut process_id);
+            // Check if the window class name is not "IME"
+            let mut class_name: [u16; 256] = [0; 256];
+            let len = winapi::um::winuser::GetClassNameW(
+                hwnd,
+                class_name.as_mut_ptr(),
+                class_name.len() as i32,
+            );
+            if len > 0 {
+                let class = String::from_utf16_lossy(&class_name[..len as usize]);
+                if class == "IME" {
+                    return 1; // Skip IME windows
+                }
+            }
 
             // Check if the process ID matches the target PID or its parent PID
             if process_id == data.target_pid {
@@ -326,7 +339,8 @@ pub fn find_hwnd_by_pid(pid: u32) -> Option<HWND> {
         }
         if process_id == data.target_pid {
             data.hwnd = hwnd;
-            return 0; // Stop enumeration
+            println!("Found window for PID {}: {:?}", data.target_pid, hwnd);
+            return 1; // Stop enumeration
         }
         1 // Continue enumeration
     }

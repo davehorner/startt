@@ -1,6 +1,6 @@
+use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use std::env;
-use std::sync::Mutex;
 
 #[derive(Default, Clone, Debug)]
 pub struct CommandLineOptions {
@@ -76,11 +76,19 @@ impl Default for GridPlacementMode {
     }
 }
 
-pub static CMD_OPTIONS: Lazy<Mutex<CommandLineOptions>> =
-    Lazy::new(|| Mutex::new(CommandLineOptions::default()));
+pub static CMD_OPTIONS: Lazy<DashMap<&'static str, CommandLineOptions>> = Lazy::new(DashMap::new);
+
 /// Access the parsed command-line options.
 pub fn get_command_line_options() -> CommandLineOptions {
-    CMD_OPTIONS.lock().unwrap().clone()
+    CMD_OPTIONS
+        .get("options")
+        .map(|entry| entry.value().clone())
+        .unwrap_or_else(CommandLineOptions::default)
+}
+
+/// Update the command-line options.
+pub fn update_command_line_options(new_options: CommandLineOptions) {
+    CMD_OPTIONS.insert("options", new_options);
 }
 
 /// Prints the program name and version, then exits.
@@ -98,7 +106,10 @@ fn print_version_and_exit() -> ! {
 }
 pub fn parse_command_line() {
     let mut args = env::args_os().skip(1).peekable();
-    let mut options = CMD_OPTIONS.lock().unwrap();
+    // Get or insert default options for mutation
+    let mut options = CMD_OPTIONS
+        .entry("options")
+        .or_insert_with(CommandLineOptions::default);
 
     while let Some(arg) = args.next() {
         let arg_str = arg.to_string_lossy();

@@ -14,8 +14,10 @@ use winapi::um::winuser::{EnumWindows, GetWindowThreadProcessId};
 pub mod cli;
 pub mod gui;
 pub mod hwnd;
+pub mod ps;
 
 static INITIAL_HWND_SET: OnceCell<HashSet<isize>> = OnceCell::new();
+static INITIAL_PID_SET: OnceCell<HashSet<u32>> = OnceCell::new();
 
 pub fn snapshot_initial_hwnds() {
     let mut hwnd_set = HashSet::new();
@@ -41,6 +43,38 @@ pub fn snapshot_initial_hwnds() {
 pub fn is_hwnd_new(hwnd: HWND) -> bool {
     if let Some(hwnd_set) = INITIAL_HWND_SET.get() {
         !hwnd_set.contains(&(hwnd as isize))
+    } else {
+        false
+    }
+}
+pub fn snapshot_initial_pids() {
+    use winapi::um::tlhelp32::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32, Process32First, Process32Next, TH32CS_SNAPPROCESS,
+    };
+    let mut pid_set = HashSet::new();
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot.is_null() {
+            return;
+        }
+        let mut entry: PROCESSENTRY32 = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32>() as u32;
+        if Process32First(snapshot, &mut entry) != 0 {
+            loop {
+                pid_set.insert(entry.th32ProcessID);
+                if Process32Next(snapshot, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snapshot);
+    }
+    INITIAL_PID_SET.set(pid_set).ok();
+}
+
+pub fn is_pid_new(pid: u32) -> bool {
+    if let Some(pid_set) = INITIAL_PID_SET.get() {
+        !pid_set.contains(&pid)
     } else {
         false
     }
@@ -943,4 +977,190 @@ pub fn get_cmdline_for_pid(pid: u32) -> Option<String> {
         CloseHandle(h_process);
         Some(String::from_utf16_lossy(&buffer))
     }
+}
+
+pub fn find_matching_env_gui_apps(
+    env_name: &str,
+    env_value: Option<&str>,
+    num_results: usize,
+) -> Vec<(HWND, u32, String, (i32, i32, i32, i32))> {
+    use winapi::um::tlhelp32::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32, Process32First, Process32Next, TH32CS_SNAPPROCESS,
+    };
+
+    // 1. Enumerate all processes and filter by is_pid_new and env var
+    let mut matching_pids = Vec::new();
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot.is_null() {
+            return Vec::new();
+        }
+        let mut entry: PROCESSENTRY32 = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32>() as u32;
+        if Process32First(snapshot, &mut entry) != 0 {
+            loop {
+                let pid = entry.th32ProcessID;
+                if is_pid_new(pid)
+                    && crate::ps::process_has_env_var(pid, env_name, env_value).unwrap_or(false)
+                {
+                    matching_pids.push(pid);
+                }
+                if Process32Next(snapshot, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snapshot);
+    }
+
+    // 2. For each matching pid, enumerate windows and collect GUI windows
+    let mut results = Vec::new();
+    for pid in matching_pids {
+        // Enumerate all windows, filter by pid
+        unsafe {
+            struct EnumData {
+                pid: u32,
+                windows: Vec<(HWND, u32, u64, String, (i32, i32, i32, i32))>,
+            }
+            extern "system" fn enum_windows_proc(hwnd: HWND, lparam: isize) -> i32 {
+                let data = unsafe { &mut *(lparam as *mut EnumData) };
+                let mut process_id = 0;
+                unsafe { GetWindowThreadProcessId(hwnd, &mut process_id) };
+                if process_id != data.pid {
+                    return 1;
+                }
+                if !is_hwnd_new(hwnd) {
+                    return 1;
+                }
+                let style = unsafe {
+                    winapi::um::winuser::GetWindowLongW(hwnd, winapi::um::winuser::GWL_STYLE)
+                };
+                if (style & winapi::um::winuser::WS_VISIBLE as i32) == 0 {
+                    return 1;
+                }
+                let parent_hwnd = unsafe { winapi::um::winuser::GetParent(hwnd) };
+                if !parent_hwnd.is_null() {
+                    // skip non-top-level
+                }
+                // Get process creation time
+                let process_handle = unsafe {
+                    OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, process_id)
+                };
+                struct CleanupHandle {
+                    handle: HANDLE,
+                }
+                impl Drop for CleanupHandle {
+                    fn drop(&mut self) {
+                        if !self.handle.is_null() {
+                            unsafe { CloseHandle(self.handle) };
+                        }
+                    }
+                }
+                let _cleanup = CleanupHandle {
+                    handle: process_handle,
+                };
+                if process_handle.is_null() {
+                    return 1;
+                }
+                // Get the class name of the window
+                let mut class_name = [0u16; 256];
+                let class_name_len = unsafe {
+                    winapi::um::winuser::GetClassNameW(
+                        hwnd,
+                        class_name.as_mut_ptr(),
+                        class_name.len() as i32,
+                    )
+                };
+                let class_name_str = if class_name_len > 0 {
+                    OsString::from_wide(&class_name[..class_name_len as usize])
+                        .to_string_lossy()
+                        .to_string()
+                } else {
+                    String::new()
+                };
+                // Get the process creation time
+                let mut creation_time = FILETIME {
+                    dwLowDateTime: 0,
+                    dwHighDateTime: 0,
+                };
+                let mut exit_time = FILETIME {
+                    dwLowDateTime: 0,
+                    dwHighDateTime: 0,
+                };
+                let mut kernel_time = FILETIME {
+                    dwLowDateTime: 0,
+                    dwHighDateTime: 0,
+                };
+                let mut user_time = FILETIME {
+                    dwLowDateTime: 0,
+                    dwHighDateTime: 0,
+                };
+                let success = unsafe {
+                    GetProcessTimes(
+                        process_handle,
+                        &mut creation_time,
+                        &mut exit_time,
+                        &mut kernel_time,
+                        &mut user_time,
+                    )
+                };
+                if success == 0 {
+                    return 1;
+                }
+                let creation_time_unix = filetime_to_unix_time(creation_time);
+                // Get the window bounds
+                let mut rect = unsafe { std::mem::zeroed() };
+                if unsafe { winapi::um::winuser::GetWindowRect(hwnd, &mut rect) } == 0 {
+                    return 1;
+                }
+                let bounds = (
+                    rect.left,
+                    rect.top,
+                    rect.right - rect.left,
+                    rect.bottom - rect.top,
+                );
+                if bounds.2 == 0 || bounds.3 == 0 {
+                    let parent_hwnd = unsafe { winapi::um::winuser::GetParent(hwnd) };
+                    if !parent_hwnd.is_null() {
+                        let mut parent_rect = unsafe { std::mem::zeroed() };
+                        if unsafe {
+                            winapi::um::winuser::GetWindowRect(parent_hwnd, &mut parent_rect)
+                        } != 0
+                        {
+                            let parent_bounds = (
+                                parent_rect.left,
+                                parent_rect.top,
+                                parent_rect.right - parent_rect.left,
+                                parent_rect.bottom - parent_rect.top,
+                            );
+                            data.windows.push((
+                                parent_hwnd,
+                                process_id,
+                                creation_time_unix,
+                                class_name_str,
+                                parent_bounds,
+                            ));
+                        }
+                    }
+                    return 1;
+                }
+                data.windows
+                    .push((hwnd, process_id, creation_time_unix, class_name_str, bounds));
+                1
+            }
+            let mut data = EnumData {
+                pid,
+                windows: Vec::new(),
+            };
+            EnumWindows(Some(enum_windows_proc), &mut data as *mut _ as isize);
+            results.extend(data.windows);
+        }
+    }
+    // Sort by creation time (most recent first)
+    results.sort_by_key(|&(_, _, creation_time, _, _)| std::cmp::Reverse(creation_time));
+    results
+        .into_iter()
+        .take(num_results)
+        .map(|(hwnd, pid, _, class_name, bounds)| (hwnd, pid, class_name, bounds))
+        .collect()
 }

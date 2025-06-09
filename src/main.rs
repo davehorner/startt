@@ -44,7 +44,7 @@ use winapi::um::winuser::{
 };
 use winapi::um::winuser::{EnumWindows, GetWindowThreadProcessId};
 use winapi::um::winuser::{
-    GetWindowPlacement, SW_MINIMIZE, SW_RESTORE, ShowWindow, WINDOWPLACEMENT,
+    GetWindowPlacement, SW_RESTORE, ShowWindow, WINDOWPLACEMENT,
 };
 
 unsafe extern "system" {
@@ -833,34 +833,32 @@ impl GridState {
     }
 
     pub fn do_the_things(&self, hwnd: HWND) {
-        let options = startt::cli::get_command_line_options();
-        if options.should_hide_border {
-            println!("Hiding border for HWND {:?}", hwnd);
-            unsafe { hide_window_border(hwnd) };
-        }
-        if options.should_hide_title_bar {
-            println!("Hiding title bar for HWND {:?}", hwnd);
-            unsafe { hide_window_title_bar(hwnd) };
-        }
-        if options.flash_topmost_ms > 0 {
-            println!(
-                "Flashing HWND {:?} as topmost for {} ms...",
-                hwnd, options.flash_topmost_ms
-            );
-            unsafe { flash_topmost(hwnd, options.flash_topmost_ms) };
-        }
-        // Shake the window in a non-blocking way (spawn a thread)
+        // Run all window effects in a separate thread
         let hwnd_copy = hwnd as isize;
-        // Spawn the shake thread and collect the JoinHandle
-        let shake_handle = std::thread::spawn(move || {
+        std::thread::spawn(move || {
+            let options = startt::cli::get_command_line_options();
+            if options.should_hide_border {
+                println!("Hiding border for HWND {:?}", hwnd_copy);
+                unsafe { hide_window_border(hwnd_copy as HWND) };
+            }
+            if options.should_hide_title_bar {
+                println!("Hiding title bar for HWND {:?}", hwnd_copy);
+                unsafe { hide_window_title_bar(hwnd_copy as HWND) };
+            }
+            if options.flash_topmost_ms > 0 {
+                println!(
+                    "Flashing HWND1 {:?} as topmost for {} ms...",
+                    hwnd_copy, options.flash_topmost_ms
+                );
+                unsafe { flash_topmost(hwnd_copy as HWND, options.flash_topmost_ms) };
+            }
+            // Shake the window in a non-blocking way (spawn a thread)
             println!(
                 "Shaking HWND {:?} for {} ms...",
                 hwnd_copy, options.shake_duration
             );
-            let hwnd = hwnd_copy as HWND;
-            unsafe { startt::hwnd::shake_window(hwnd, 10, options.shake_duration) };
+            unsafe { startt::hwnd::shake_window(hwnd_copy as HWND, 10, options.shake_duration) };
         });
-        add_shake_handle(shake_handle);
     }
 
     pub fn set_parent_cell_locked(self, parent_cell_idx: Option<usize>, parent_hwnd: HWND) {
@@ -1617,7 +1615,7 @@ fn main() -> windows::core::Result<()> {
     let mut positional_args = Vec::new();
     let mut timeout_secs: Option<u64> = None;
     let mut hwnd_start_times: HashMap<HWND, Instant> = HashMap::new();
-    let mut flash_topmost_ms: u64 = 10; // default to 10ms
+    let mut flash_topmost_ms: u64 = 0;
     let mut should_hide_title_bar = false;
     let mut should_hide_border = false;
     let mut args = env::args_os().skip(1).peekable();
@@ -1635,10 +1633,13 @@ fn main() -> windows::core::Result<()> {
     let mut num_recent: usize = 1; // Default value
     let mut sleep_duration_ms: u64 = 0;
     let mut use_find_oldest = false;
+    let mut use_find_recent = false;
     while let Some(arg) = args.next() {
         let arg_str = arg.to_string_lossy();
         if arg_str == "--find-oldest" || arg_str == "-fo" {
             use_find_oldest = true;
+        } else if arg_str == "--find-recent" || arg_str == "-fr" {
+            use_find_recent = true;
         } else if arg_str == "--sleep-duration" || arg_str == "-sd" {
             let dur_arg = args
                 .next()
@@ -1877,7 +1878,9 @@ fn main() -> windows::core::Result<()> {
     };
 
     startt::snapshot_initial_hwnds();
-
+    startt::snapshot_initial_pids();
+    let pid = std::process::id();
+    unsafe { std::env::set_var("STARTT", pid.to_string()) };
     // Launch the process
     let mut sei = winapi::um::shellapi::SHELLEXECUTEINFOW {
         cbSize: std::mem::size_of::<winapi::um::shellapi::SHELLEXECUTEINFOW>() as u32,
@@ -1986,19 +1989,25 @@ fn main() -> windows::core::Result<()> {
         if sleep_duration_ms > 0 {
             sleep(Duration::from_millis(sleep_duration_ms));
         }
-        let mut gui = if use_find_oldest || follow_children {
+        let mut gui = if use_find_oldest {
             startt::find_oldest_recent_apps(
                 &file.to_string_lossy(),
                 num_recent,
                 Some(parent_pid),
                 Some(launching_pid),
             )
-        } else {
+        } else if use_find_recent {
             startt::find_most_recent_gui_apps(
                 &file.to_string_lossy(),
                 num_recent,
                 Some(parent_pid),
                 Some(launching_pid),
+            )
+        } else {
+            startt::find_matching_env_gui_apps(
+                "STARTT",
+                Some(&format!("{}", std::process::id())),
+                num_recent,
             )
         };
         let mut parent_pids: HashSet<u32> = HashSet::new();
@@ -2008,6 +2017,23 @@ fn main() -> windows::core::Result<()> {
                 let wait_result = winapi::um::synchapi::WaitForSingleObject(handle, 0);
                 if wait_result != winapi::um::winbase::WAIT_OBJECT_0 {
                     // Parent is still alive, try to find its HWND
+                    // Print parent process executable name
+                    let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, parent_pid);
+                    if !handle.is_null() {
+                        let mut buf = [0u16; 260];
+                        let len =
+                            GetProcessImageFileNameW(handle, buf.as_mut_ptr(), buf.len() as u32);
+                        if len > 0 {
+                            let exe = String::from_utf16_lossy(&buf[..len as usize]);
+                            println!("Parent process executable: {}", exe);
+                        }
+                        CloseHandle(handle);
+                    } else {
+                        println!(
+                            "Could not open parent process {} to get executable name.",
+                            parent_pid
+                        );
+                    }
                     println!(
                         "Parent process {} is still alive. Searching for HWND...",
                         parent_pid
@@ -2555,38 +2581,41 @@ fn main() -> windows::core::Result<()> {
                         }
                     }
                 }
+                if let Some(ref mut grid_state) = grid_state_arc.lock().unwrap().as_mut() {
+                    grid_state.do_the_things(hwnd);
+                }
+                // {
+                //     let mut phwnd = parent_hwnd.lock().unwrap();
+                //     *phwnd = Some(hwnd as isize);
+                // }
+                // if should_hide_border {
+                //     println!("Hiding border for HWND {:?}", hwnd);
+                //     hide_window_border(hwnd);
+                // }
+                // if should_hide_title_bar {
+                //     println!("Hiding title bar for HWND {:?}", hwnd);
+                //     hide_window_title_bar(hwnd);
+                // }
+                // if flash_topmost_ms > 0 {
+                //     println!(
+                //         "Flashing HWND2 {:?} as topmost for {} ms...",
+                //         hwnd, flash_topmost_ms
+                //     );
+                //     flash_topmost(hwnd, flash_topmost_ms);
+                // }
+                // // Shake the window in a non-blocking way (spawn a thread)
+                // let hwnd_copy = hwnd as isize;
+                // let shake_handle = std::thread::spawn(move || {
+                //     let hwnd = hwnd_copy as HWND;
+                //     startt::hwnd::shake_window(hwnd, 10, shake_duration);
+                // });
+                // add_shake_handle(hwnd as isize, shake_handle);
 
-                {
-                    let mut phwnd = parent_hwnd.lock().unwrap();
-                    *phwnd = Some(hwnd as isize);
-                }
-                if should_hide_border {
-                    println!("Hiding border for HWND {:?}", hwnd);
-                    hide_window_border(hwnd);
-                }
-                if should_hide_title_bar {
-                    println!("Hiding title bar for HWND {:?}", hwnd);
-                    hide_window_title_bar(hwnd);
-                }
-                if flash_topmost_ms > 0 {
-                    println!(
-                        "Flashing HWND {:?} as topmost for {} ms...",
-                        hwnd, flash_topmost_ms
-                    );
-                    flash_topmost(hwnd, flash_topmost_ms);
-                }
-                // Shake the window in a non-blocking way (spawn a thread)
-                let hwnd_copy = hwnd as isize;
-                let shake_handle = std::thread::spawn(move || {
-                    let hwnd = hwnd_copy as HWND;
-                    startt::hwnd::shake_window(hwnd, 10, shake_duration);
-                });
-                add_shake_handle(shake_handle);
+                // if was_minimized {
+                //     println!("Re-minimizing window: {:?}", hwnd);
+                //     ShowWindow(hwnd, SW_MINIMIZE);
+                // }
 
-                if was_minimized {
-                    println!("Re-minimizing window: {:?}", hwnd);
-                    ShowWindow(hwnd, SW_MINIMIZE);
-                }
                 // if !hwnd_start_times.contains_key(&hwnd) {
                 //     hwnd_start_times.insert(hwnd, Instant::now());  // maybe a --time-out-all in the future?
                 // }
@@ -2602,31 +2631,67 @@ fn main() -> windows::core::Result<()> {
                 if startt::is_hwnd_new(hwnd) {
                     {
                         println!("New HWND found: {:?}", hwnd);
+
+                        // Print window class and title
+                        let mut class_name = [0u16; 256];
+                        let class_name_len = winapi::um::winuser::GetClassNameW(
+                            hwnd,
+                            class_name.as_mut_ptr(),
+                            class_name.len() as i32,
+                        );
+                        let class_name_str = if class_name_len > 0 {
+                            std::ffi::OsString::from_wide(&class_name[..class_name_len as usize])
+                                .to_string_lossy()
+                                .to_string()
+                        } else {
+                            String::from("<unknown>")
+                        };
+
+                        let mut title = [0u16; 256];
+                        let title_len = winapi::um::winuser::GetWindowTextW(
+                            hwnd,
+                            title.as_mut_ptr(),
+                            title.len() as i32,
+                        );
+                        let title_str = if title_len > 0 {
+                            std::ffi::OsString::from_wide(&title[..title_len as usize])
+                                .to_string_lossy()
+                                .to_string()
+                        } else {
+                            String::from("<no title>")
+                        };
+
+                        println!("  Class: {}", class_name_str);
+                        println!("  Title: {}", title_str);
                         let mut phwnd = parent_hwnd.lock().unwrap();
                         *phwnd = Some(hwnd as isize);
                     }
-                    if should_hide_border {
-                        println!("Hiding border for HWND {:?}", hwnd);
-                        startt::hwnd::hide_window_border(hwnd);
+
+                    if let Some(ref mut grid_state) = grid_state_arc.lock().unwrap().as_mut() {
+                        grid_state.do_the_things(hwnd);
                     }
-                    if should_hide_title_bar {
-                        println!("Hiding title bar for HWND {:?}", hwnd);
-                        startt::hwnd::hide_window_title_bar(hwnd);
-                    }
-                    if flash_topmost_ms > 0 {
-                        println!(
-                            "Flashing HWND {:?} as topmost for {} ms...",
-                            hwnd, flash_topmost_ms
-                        );
-                        startt::hwnd::flash_topmost(hwnd, flash_topmost_ms);
-                    }
-                    // Shake the window in a non-blocking way (spawn a thread)
-                    let hwnd_copy = hwnd as isize;
-                    let shake_handle = std::thread::spawn(move || {
-                        let hwnd = hwnd_copy as HWND;
-                        startt::hwnd::shake_window(hwnd, 10, shake_duration);
-                    });
-                    add_shake_handle(shake_handle);
+                    // if should_hide_border {
+                    //     println!("Hiding border for HWND {:?}", hwnd);
+                    //     startt::hwnd::hide_window_border(hwnd);
+                    // }
+                    // if should_hide_title_bar {
+                    //     println!("Hiding title bar for HWND {:?}", hwnd);
+                    //     startt::hwnd::hide_window_title_bar(hwnd);
+                    // }
+                    // if flash_topmost_ms > 0 {
+                    //     println!(
+                    //         "Flashing HWND3 {:?} as topmost for {} ms...",
+                    //         hwnd, flash_topmost_ms
+                    //     );
+                    //     startt::hwnd::flash_topmost(hwnd, flash_topmost_ms);
+                    // }
+                    // // Shake the window in a non-blocking way (spawn a thread)
+                    // let hwnd_copy = hwnd as isize;
+                    // let shake_handle = std::thread::spawn(move || {
+                    //     let hwnd = hwnd_copy as HWND;
+                    //     startt::hwnd::shake_window(hwnd, 10, shake_duration);
+                    // });
+                    // add_shake_handle(hwnd as isize, shake_handle);
                 }
             } else {
                 eprintln!("Failed to find HWND for PID {}", parent_pid);
@@ -2665,22 +2730,133 @@ fn main() -> windows::core::Result<()> {
 
             // let child_pids = get_child_pids(parent_pid);
             // println!("Child PIDs: {:?}", child_pids);
+            println!("Tracking child windows for parent PID: {}", parent_pid);
 
+            // Check if the parent PID is still running; if not, set running = false
+            let handle = OpenProcess(winapi::um::winnt::SYNCHRONIZE, 0, parent_pid);
+            if handle.is_null() {
+                println!(
+                    "Parent process {} has terminated. Exiting follow_children loop.",
+                    parent_pid
+                );
+                running.store(false, Ordering::SeqCst);
+                break;
+            } else {
+                let wait_result = winapi::um::synchapi::WaitForSingleObject(handle, 0);
+                CloseHandle(handle);
+                if wait_result == winapi::um::winbase::WAIT_OBJECT_0 {
+                    println!(
+                        "Parent process {} has terminated. Exiting follow_children loop.",
+                        parent_pid
+                    );
+                    running.store(false, Ordering::SeqCst);
+                    break;
+                }
+            }
+
+            // Print parent HWND, PID, class, title, and executable
+            let parent_hwnd_val = {
+                let phwnd = parent_hwnd.lock().unwrap();
+                *phwnd
+            };
+            if let Some(parent_hwnd_isize) = parent_hwnd_val {
+                let parent_hwnd_win = parent_hwnd_isize as HWND;
+                // Class name
+                let mut class_name = [0u16; 256];
+                let class_name_len = unsafe {
+                    winapi::um::winuser::GetClassNameW(
+                        parent_hwnd_win,
+                        class_name.as_mut_ptr(),
+                        class_name.len() as i32,
+                    )
+                };
+                let class_name_str = if class_name_len > 0 {
+                    OsString::from_wide(&class_name[..class_name_len as usize])
+                        .to_string_lossy()
+                        .to_string()
+                } else {
+                    String::from("<unknown>")
+                };
+
+                // Title
+                let mut title = [0u16; 256];
+                let title_len = unsafe {
+                    winapi::um::winuser::GetWindowTextW(
+                        parent_hwnd_win,
+                        title.as_mut_ptr(),
+                        title.len() as i32,
+                    )
+                };
+                let title_str = if title_len > 0 {
+                    OsString::from_wide(&title[..title_len as usize])
+                        .to_string_lossy()
+                        .to_string()
+                } else {
+                    String::from("<no title>")
+                };
+
+                // Executable
+                let exe_str = {
+                    let handle =
+                        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, parent_pid) };
+                    if !handle.is_null() {
+                        let mut buf = [0u16; 260];
+                        let len = unsafe {
+                            GetProcessImageFileNameW(handle, buf.as_mut_ptr(), buf.len() as u32)
+                        };
+                        unsafe {
+                            CloseHandle(handle);
+                        }
+                        if len > 0 {
+                            String::from_utf16_lossy(&buf[..len as usize])
+                        } else {
+                            String::from("<unknown exe>")
+                        }
+                    } else {
+                        String::from("<unknown exe>")
+                    }
+                };
+
+                // Print command line arguments for the parent process
+                let cmdline = { startt::get_cmdline_for_pid(parent_pid) };
+                let has_env = startt::ps::process_has_env_var(parent_pid, "PATH", None);
+                //let env = startt::ps::process_print_env(parent_pid);
+                println!(
+                    "{:?} Parent HWND: {:?}, PID: {}, Class: '{}', Title: '{}', Executable: '{}', Cmdline: '{:?}'",
+                    has_env,
+                    parent_hwnd_win,
+                    parent_pid,
+                    class_name_str,
+                    title_str,
+                    exe_str,
+                    cmdline, //env.unwrap_or_default()
+                );
+            }
             // Use a HashSet to avoid duplicates and for faster lookup
             let mut child_pids: HashSet<u32> = HashSet::new();
 
-            // Iterate over each parent PID and collect its child PIDs
-            for parent_pid in &parent_pids {
-                let parent_child_pids = startt::get_child_pids(*parent_pid);
-                child_pids.extend(parent_child_pids.into_iter());
+            // If using --find-recent or --find-oldest, collect child PIDs from parent_pids and ETW
+            if use_find_recent || use_find_oldest {
+                // Iterate over each parent PID and collect its child PIDs
+                for parent_pid in &parent_pids {
+                    let parent_child_pids = startt::get_child_pids(*parent_pid);
+                    child_pids.extend(parent_child_pids.into_iter());
+                }
+
+                // Add ETW-tracked PIDs
+                let etw_pids = tracked_pids.lock().unwrap();
+                child_pids.extend(etw_pids.iter().copied());
+
+                // Add all parent PIDs to the child_pids set
+                child_pids.extend(parent_pids.iter().copied());
+            } else {
+                // Otherwise, search by environment variable (STARTT)
+                let env_pids = startt::ps::get_env_child_pids(
+                    "STARTT",
+                    Some(&format!("{}", std::process::id())),
+                    &mut child_pids,
+                );
             }
-
-            // Add ETW-tracked PIDs
-            let etw_pids = tracked_pids.lock().unwrap();
-            child_pids.extend(etw_pids.iter().copied());
-
-            // Add all parent PIDs to the child_pids set
-            child_pids.extend(parent_pids.iter().copied());
 
             // println!("Child PIDs (snapshot + ETW + parent/launcher): {:?}", child_pids);
 
@@ -2837,6 +3013,12 @@ fn main() -> windows::core::Result<()> {
             // }
 
             for (hwnd, pid) in hwnd_pid_map.iter() {
+                // Example: check if isvalid, if not, break
+                let isvalid = unsafe { winapi::um::winuser::IsWindow(*hwnd) != 0 };
+                if !isvalid {
+                    continue;
+                }
+
                 let mut title = [0u16; 256];
                 let title_len = unsafe {
                     winapi::um::winuser::GetWindowTextW(
@@ -3212,16 +3394,22 @@ pub fn install_window_destroy_hook(
 //     }
 // }
 use once_cell::sync::Lazy;
-static SHAKE_HANDLES: Lazy<Mutex<Vec<std::thread::JoinHandle<()>>>> =
-    Lazy::new(|| Mutex::new(Vec::new()));
+use winapi::um::psapi::GetProcessImageFileNameW;
+use winapi::um::winnt::PROCESS_QUERY_LIMITED_INFORMATION;
+static SHAKE_HANDLES: Lazy<DashMap<isize, std::thread::JoinHandle<()>>> = Lazy::new(DashMap::new);
 
-fn add_shake_handle(handle: std::thread::JoinHandle<()>) {
-    SHAKE_HANDLES.lock().unwrap().push(handle);
+fn add_shake_handle(hwnd: isize, handle: std::thread::JoinHandle<()>) {
+    SHAKE_HANDLES.insert(hwnd, handle);
 }
 
 fn wait_for_shake_handles() {
-    let mut handles = SHAKE_HANDLES.lock().unwrap();
-    while let Some(handle) = handles.pop() {
-        let _ = handle.join();
+    // Collect keys to remove, then remove and join outside of retain closure
+    let keys: Vec<isize> = SHAKE_HANDLES.iter().map(|entry| *entry.key()).collect();
+    for hwnd in keys {
+        if let Some((_, handle)) = SHAKE_HANDLES.remove(&hwnd) {
+            if handle.join().is_err() {
+                eprintln!("Failed to join shake handle");
+            }
+        }
     }
 }
