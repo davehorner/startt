@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.19](https://github.com/davehorner/startt/compare/v0.1.18...v0.1.19) - 2025-06-09
+
+### Added
+
+- refactor command-line options management and enhance process handling features
+
 ## [0.1.18](https://github.com/davehorner/startt/compare/v0.1.17...v0.1.18) - 2025-06-05
 
 ### Added
