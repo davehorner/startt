@@ -116,7 +116,7 @@ pub fn parse_command_line() {
 
         match arg_str.as_ref() {
             "--version" => print_version_and_exit(),
-            "-f" | "--follow" => options.follow_children = true,
+            "-f" | "--follow" | "/WAIT" | "/wait" => options.follow_children = true,
             "-F" | "--follow-forever" => {
                 options.follow_children = true;
                 options.follow_forever = true;

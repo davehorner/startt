@@ -1648,7 +1648,7 @@ fn main() -> windows::core::Result<()> {
                 .to_string_lossy()
                 .parse()
                 .expect("Invalid sleep duration value");
-        } else if arg_str == "-f" || arg_str == "--follow" {
+        } else if arg_str == "-f" || arg_str == "--follow" || arg_str == "/wait" || arg_str == "/WAIT" {
             follow_children = true;
         } else if arg_str == "--num-recent" || arg_str == "-nr" {
             let num_arg = args
